@@ -15,10 +15,29 @@
 struct AdapterInfo
 {
     std::wstring description;
-    unsigned     vendorId = 0;
-    unsigned     deviceId = 0;
+    unsigned     vendorId        = 0;
+    unsigned     deviceId        = 0;
+    uint64_t     dedicatedVideoMemory  = 0;
+    uint64_t     dedicatedSystemMemory = 0;
+    uint64_t     sharedSystemMemory    = 0;
     LUID         luid {};
     bool         isSoftware = false;
+
+    /* PCI vendor IDs, so the UI can label an adapter without string matching. */
+    static constexpr unsigned kVendorAmd    = 0x1002;
+    static constexpr unsigned kVendorNvidia = 0x10DE;
+    static constexpr unsigned kVendorIntel  = 0x8086;
+
+    const wchar_t* VendorName() const
+    {
+        switch(vendorId)
+        {
+        case kVendorAmd: return L"AMD";
+        case kVendorNvidia: return L"NVIDIA";
+        case kVendorIntel: return L"Intel";
+        default: return L"Unknown";
+        }
+    }
 };
 
 struct RenderTimings
@@ -26,6 +45,15 @@ struct RenderTimings
     double uploadMs  = 0.0;
     double drawMs    = 0.0;
     double presentMs = 0.0;
+};
+
+/* How the captured bytes reach the back buffer. Prism prefers a texture format
+ * that matches the source exactly, so the usual answer is "no conversion". */
+enum class PixelPath
+{
+    DirectBgra, /* PipeWire BGRx/BGRA -> DXGI_FORMAT_B8G8R8A8_UNORM */
+    DirectRgba, /* PipeWire RGBx/RGBA -> DXGI_FORMAT_R8G8B8A8_UNORM */
+    CpuSwizzle, /* only in the no-shader fallback, where the blit cannot swap */
 };
 
 /*
@@ -53,6 +81,9 @@ public:
     void OnResize(UINT width, UINT height);
 
     bool UploadFrame(const CapturedFrame& frame);
+
+    PixelPath           CurrentPixelPath() const { return m_pixelPath; }
+    const AdapterInfo&  ActiveAdapter() const { return m_activeAdapter; }
     bool Present(DisplayMode mode, bool vsync);
 
     const std::wstring& AdapterDescription() const { return m_adapterDescription; }
@@ -67,7 +98,7 @@ private:
     bool CreateDeviceAndSwapChain(int adapterIndex);
     bool CreateBackBufferViews();
     bool CreatePresentPipeline();
-    bool EnsureSourceTexture(UINT width, UINT height);
+    bool EnsureSourceTexture(UINT width, UINT height, DXGI_FORMAT format);
     void ComputeMapping(DisplayMode mode, float outScaleOffset[4], bool& pointSampling) const;
     void ReleaseBackBuffer();
 
@@ -96,8 +127,11 @@ private:
 
     UINT m_backBufferWidth  = 0;
     UINT m_backBufferHeight = 0;
-    UINT m_sourceWidth      = 0;
-    UINT m_sourceHeight     = 0;
+    UINT        m_sourceWidth  = 0;
+    UINT        m_sourceHeight = 0;
+    DXGI_FORMAT m_sourceFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
+    PixelPath   m_pixelPath    = PixelPath::DirectBgra;
+    AdapterInfo m_activeAdapter;
     bool m_allowTearing     = false;
     bool m_flipModel        = false;
 

@@ -16,7 +16,8 @@ Prism/
 │   ├── CaptureBridge.cpp/.h    loads PrismCapture.dll
 │   ├── FrameMailbox.cpp/.h     latest-frame triple buffer
 │   ├── TestPattern.cpp/.h      synthetic source for bring-up
-│   ├── Diagnostics.cpp/.h      counters, ReShade detection, report
+│   ├── Hotkeys.cpp/.h          portal shortcuts + RegisterHotKey fallback
+│   ├── Diagnostics.cpp/.h      counters, ReShade/GPU detection, report
 │   ├── Settings.cpp/.h         Prism.ini
 │   └── Common.h                shared helpers, ComPtr
 ├── bridge/                     PrismCapture.dll (Winelib ELF)
@@ -24,12 +25,22 @@ Prism/
 │   ├── PrismCapture.spec       export table
 │   ├── prism_bridge.c          ABI surface, capture thread
 │   ├── screencast.c/.h         XDG ScreenCast portal driver
-│   ├── portal.c/.h             Request/Response helper
+│   ├── shortcuts.c/.h          XDG GlobalShortcuts portal driver
+│   ├── sysinfo.c/.h            PCI/DRM/PCIe introspection from sysfs
+│   ├── portal.c/.h             Request/Response helper, host app-id registration
 │   ├── pipewire.c/.h           stream negotiation, frame arrival
 │   └── prism_log.h             logging, monotonic clock
 ├── scripts/
 │   ├── build.sh                builds both halves into build/dist
-│   └── run-prism.sh            launches under Wine or Proton
+│   ├── run-prism.sh            launches under Wine or Proton, optional --gpu
+│   ├── lib-gpu.sh              shared GPU detection helpers
+│   ├── check-gpus.sh           read-only GPU/DRM/PCIe/Vulkan report
+│   ├── configure-gpu-policy.sh pins KWin to the AMD GPU (reversible, opt-in)
+│   └── install-desktop-file.sh registers the portal application id
+├── packaging/
+│   └── net.prism.Prism.desktop the entry the portal matches the app id against
+├── tests/
+│   └── mock_globalshortcuts_portal.py  drives the shortcut handshake with no compositor
 └── docs/
 ```
 

@@ -16,10 +16,12 @@ const wchar_t kDiagnosticsClass[] = L"PrismDiagnosticsWindow";
  * also the cheapest always-visible status readout, so it carries the summary. */
 const wchar_t kBaseTitle[] = L"Prism";
 
-constexpr UINT WM_PRISM_TRAY   = WM_APP + 1;
-constexpr UINT WM_PRISM_STATUS = WM_APP + 2;
+constexpr UINT WM_PRISM_TRAY     = WM_APP + 1;
+constexpr UINT WM_PRISM_STATUS   = WM_APP + 2;
+constexpr UINT WM_PRISM_SHORTCUT = WM_APP + 3;
 
 constexpr UINT_PTR kStatusTimerId = 1;
+constexpr UINT_PTR kDumpTimerId   = 2;
 
 enum MenuId : int
 {
@@ -33,11 +35,19 @@ enum MenuId : int
     IdAbout,
     IdVSync,
 
+    IdGameplayOutput = 110,
+    IdExitGameplay,
+    IdToggleInteraction,
+    IdConfigureShortcuts,
+    IdShowPrism,
+    IdSaveReport,
+
     IdDisplayModeBase = 200, /* +DisplayMode */
     IdWindowModeBase  = 220, /* +WindowMode  */
     IdFpsBase         = 300, /* +index into kFpsCeilings */
     IdSourceTypeBase  = 400, /* +0 any, +1 monitor only, +2 window only   */
     IdAdapterBase     = 500, /* +adapter index, IdAdapterBase-1 = default */
+    IdMonitorBase     = 600, /* +monitor index, IdMonitorBase-1 = follow window */
 };
 
 /* How long Prism will sit on the same image before presenting it again. Keeps
@@ -61,6 +71,7 @@ bool App::Initialize(HINSTANCE instance, int showCommand)
     m_settings.Load();
     ParseCommandLine();
     m_adapters = Renderer::EnumerateAdapters();
+    RefreshMonitors();
 
     if(!CreateOutputWindow(showCommand))
         return false;
@@ -80,6 +91,8 @@ bool App::Initialize(HINSTANCE instance, int showCommand)
     m_bridge.SetStatusWindow(m_window, WM_PRISM_STATUS);
     if(!m_bridge.Load())
         PrismLog("capture bridge unavailable: %ls", m_bridge.LoadError().c_str());
+    else if(!m_bridge.CaptureAvailable())
+        PrismLog("capture unavailable: %ls", m_bridge.CaptureError().c_str());
 
     BuildMenus();
     CreateTrayIcon();
@@ -92,11 +105,28 @@ bool App::Initialize(HINSTANCE instance, int showCommand)
     if(m_settings.showDiagnostics)
         ToggleDiagnostics(true);
 
+    /* The mailbox only swaps channels when the renderer cannot: with shaders
+     * available Prism picks a texture format that matches the source instead. */
+    m_bridge.Mailbox().SetSwizzleRgbToBgr(!m_renderer.UsesShaderPath());
+
+    /* Global hotkeys go through the XDG GlobalShortcuts portal, so they work
+     * while the game has focus. This is the only Wayland-correct route. */
+    m_hotkeys.Start(m_bridge, m_window, WM_PRISM_SHORTCUT, m_settings.hotkeyToggleMode,
+                    m_settings.hotkeyHideOutput);
+
     if(m_testPatternRequested)
     {
         PrismLog("starting the synthetic test pattern instead of a capture session");
         m_testPattern.Start(m_bridge.Mailbox(), 1280, 720, m_settings.maxFps ? m_settings.maxFps : 60);
     }
+
+    if(m_gameplayRequested)
+        EnterGameplayOutput();
+
+    /* --dump-diagnostics: give capture and the portal a few seconds to settle,
+     * then write the report once. */
+    if(m_dumpDiagnostics)
+        SetTimer(m_window, kDumpTimerId, 10000, nullptr);
 
     SetTimer(m_window, kStatusTimerId, 500, nullptr);
     return true;
@@ -120,6 +150,15 @@ void App::ParseCommandLine()
             m_testPatternRequested = true;
         else if(_wcsicmp(argv[i], L"--diagnostics") == 0)
             m_settings.showDiagnostics = true;
+        else if(_wcsicmp(argv[i], L"--dump-diagnostics") == 0)
+        {
+            m_dumpDiagnostics          = true;
+            m_settings.showDiagnostics = true;
+        }
+        else if(_wcsicmp(argv[i], L"--gameplay") == 0)
+            m_gameplayRequested = true;
+        else if(_wcsnicmp(argv[i], L"--monitor=", 10) == 0)
+            m_settings.outputMonitorIndex = _wtoi(argv[i] + 10);
     }
     LocalFree(argv);
 }
@@ -131,6 +170,7 @@ void App::Shutdown()
     if(m_window)
         KillTimer(m_window, kStatusTimerId);
 
+    m_hotkeys.Stop();
     m_testPattern.Stop();
     m_bridge.Stop();
     m_bridge.Shutdown();
@@ -255,9 +295,15 @@ LRESULT App::HandleMessage(HWND window, UINT message, WPARAM wParam, LPARAM lPar
     case WM_TIMER:
         if(wParam == kStatusTimerId)
         {
-            SetWindowTextW(m_window, m_diagnostics.BuildSummary(IsCapturing(), m_testPattern.IsRunning()).c_str());
+            SetWindowTextW(m_window, m_diagnostics.BuildSummary(IsCapturing(), m_testPattern.IsRunning(), m_gameplayOutput).c_str());
+            m_hotkeys.Poll();
             UpdateTrayIcon();
             UpdateDiagnostics();
+        }
+        else if(wParam == kDumpTimerId)
+        {
+            KillTimer(m_window, kDumpTimerId);
+            SaveDiagnosticsReport();
         }
         return 0;
 
@@ -266,6 +312,16 @@ LRESULT App::HandleMessage(HWND window, UINT message, WPARAM wParam, LPARAM lPar
         UpdateTrayIcon();
         if(static_cast<unsigned>(wParam) == PRISM_STATE_ERROR)
             PrismLog("capture error: %ls", m_bridge.StatusMessage().c_str());
+        return 0;
+
+    case WM_PRISM_SHORTCUT:
+        OnShortcut(static_cast<PrismShortcut>(wParam));
+        return 0;
+
+    case WM_HOTKEY:
+        /* Only reached when the portal was unavailable and the RegisterHotKey
+         * fallback is armed. */
+        OnShortcut(static_cast<PrismShortcut>(wParam - 0xB100));
         return 0;
 
     case WM_PRISM_TRAY:
@@ -290,6 +346,13 @@ LRESULT App::HandleMessage(HWND window, UINT message, WPARAM wParam, LPARAM lPar
         else if(wParam == VK_ESCAPE && m_settings.windowMode == WindowMode::Fullscreen)
             ApplyWindowMode(WindowMode::Windowed);
         return 0;
+
+    case WM_MOUSEACTIVATE:
+        /* Belt to WS_EX_NOACTIVATE's braces: in gameplay mode a click must not
+         * pull focus away from the game, and it must not be swallowed either. */
+        if(m_interaction == InteractionMode::Gameplay)
+            return MA_NOACTIVATEANDEAT;
+        break;
 
     case WM_CLOSE:
         DestroyWindow(window);
@@ -334,8 +397,17 @@ void App::BuildMenus()
     AppendMenuW(display, MF_STRING, IdWindowModeBase + 1, L"&Borderless");
     AppendMenuW(display, MF_STRING, IdWindowModeBase + 2, L"F&ullscreen\tAlt+Enter");
     AppendMenuW(display, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(display, MF_STRING, IdGameplayOutput, L"&Gameplay Output");
     AppendMenuW(display, MF_STRING, IdVSync, L"&V-Sync");
     AppendMenuW(m_menuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(display), L"&Display");
+
+    HMENU output = CreatePopupMenu();
+    AppendMenuW(output, MF_STRING, IdMonitorBase - 1, L"Follow the Prism &window");
+    if(!m_monitors.empty())
+        AppendMenuW(output, MF_SEPARATOR, 0, nullptr);
+    for(size_t i = 0; i < m_monitors.size(); ++i)
+        AppendMenuW(output, MF_STRING, IdMonitorBase + static_cast<int>(i), m_monitors[i].name.c_str());
+    AppendMenuW(m_menuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(output), L"&Output Display");
 
     HMENU frameRate = CreatePopupMenu();
     for(size_t i = 0; i < std::size(kFpsCeilings); ++i)
@@ -357,7 +429,11 @@ void App::BuildMenus()
 
     HMENU view = CreatePopupMenu();
     AppendMenuW(view, MF_STRING, IdHideOutput, L"&Hide Output");
+    AppendMenuW(view, MF_STRING, IdToggleInteraction, L"&Toggle Gameplay / Configuration");
+    AppendMenuW(view, MF_STRING, IdConfigureShortcuts, L"Configure Global &Shortcuts...");
+    AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(view, MF_STRING, IdDiagnostics, L"&Diagnostics...");
+    AppendMenuW(view, MF_STRING, IdSaveReport, L"Save Diagnostics &Report");
     AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(view, MF_STRING, IdAbout, L"&About Prism");
     AppendMenuW(m_menuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(view), L"&View");
@@ -389,6 +465,14 @@ void App::RefreshMenuChecks()
     CheckMenuItem(m_menuBar, IdSourceTypeBase + 2,
                   MF_BYCOMMAND | (sourceMask == PRISM_SOURCE_WINDOW ? MF_CHECKED : MF_UNCHECKED));
 
+    CheckMenuItem(m_menuBar, IdGameplayOutput, MF_BYCOMMAND | (m_gameplayOutput ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(m_menuBar, IdMonitorBase - 1,
+                  MF_BYCOMMAND | (m_settings.outputMonitorIndex < 0 ? MF_CHECKED : MF_UNCHECKED));
+    for(size_t i = 0; i < m_monitors.size(); ++i)
+        CheckMenuItem(m_menuBar, IdMonitorBase + static_cast<int>(i),
+                      MF_BYCOMMAND |
+                          (m_settings.outputMonitorIndex == static_cast<int>(i) ? MF_CHECKED : MF_UNCHECKED));
+
     CheckMenuItem(m_menuBar, IdCaptureCursor, MF_BYCOMMAND | (m_settings.captureCursor ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(m_menuBar, IdVSync, MF_BYCOMMAND | (m_settings.vsync ? MF_CHECKED : MF_UNCHECKED));
 
@@ -400,7 +484,7 @@ void App::RefreshMenuChecks()
                           (m_settings.adapterIndex == static_cast<int>(i) ? MF_CHECKED : MF_UNCHECKED));
 
     EnableMenuItem(m_menuBar, IdSelectSource,
-                   MF_BYCOMMAND | (m_bridge.IsLoaded() && !m_bridge.IsActive() ? MF_ENABLED : MF_GRAYED));
+                   MF_BYCOMMAND | (m_bridge.CaptureAvailable() && !m_bridge.IsActive() ? MF_ENABLED : MF_GRAYED));
     EnableMenuItem(m_menuBar, IdStopCapture, MF_BYCOMMAND | (m_bridge.IsActive() ? MF_ENABLED : MF_GRAYED));
 
     DrawMenuBar(m_window);
@@ -431,6 +515,18 @@ void App::OnCommand(int commandId)
     {
         static const unsigned masks[] = {PRISM_SOURCE_ANY, PRISM_SOURCE_MONITOR, PRISM_SOURCE_WINDOW};
         m_settings.sourceTypes        = masks[commandId - IdSourceTypeBase];
+        RefreshMenuChecks();
+        return;
+    }
+    if(commandId >= IdMonitorBase - 1 && commandId < IdMonitorBase + static_cast<int>(m_monitors.size()))
+    {
+        m_settings.outputMonitorIndex = (commandId == IdMonitorBase - 1) ? -1 : commandId - IdMonitorBase;
+        if(m_gameplayOutput)
+        {
+            const RECT bounds = TargetMonitorRect();
+            SetWindowPos(m_window, m_settings.gameplayTopmost ? HWND_TOPMOST : HWND_TOP, bounds.left, bounds.top,
+                         bounds.right - bounds.left, bounds.bottom - bounds.top, SWP_NOACTIVATE);
+        }
         RefreshMenuChecks();
         return;
     }
@@ -470,15 +566,37 @@ void App::OnCommand(int commandId)
         RefreshMenuChecks();
         break;
     case IdShowOutput: ShowOutput(true); break;
-    case IdHideOutput: ShowOutput(false); break;
+    case IdHideOutput:
+        if(m_gameplayOutput)
+            ExitGameplayOutput();
+        else
+            ShowOutput(false);
+        break;
+    case IdGameplayOutput:
+        if(m_gameplayOutput)
+            ExitGameplayOutput();
+        else
+            EnterGameplayOutput();
+        break;
+    case IdExitGameplay: ExitGameplayOutput(); break;
+    case IdToggleInteraction: OnShortcut(PrismShortcut::ToggleMode); break;
+    case IdConfigureShortcuts: m_hotkeys.Configure(); break;
+    case IdShowPrism:
+        ShowOutput(true);
+        SetInteractionMode(InteractionMode::Configuration);
+        break;
     case IdDiagnostics: ToggleDiagnostics(!m_settings.showDiagnostics); break;
+    case IdSaveReport: SaveDiagnosticsReport(); break;
     case IdAbout:
         MessageBoxW(m_window,
                     L"Prism - a screen-capture host for Proton/Wine.\r\n\r\n"
                     L"Captures a Linux window, monitor or desktop through the XDG ScreenCast portal "
                     L"and PipeWire, presents it through Direct3D 11, and lets ReShade process the "
                     L"result inside Prism.exe.\r\n\r\n"
-                    L"The captured application is never opened, hooked or modified.",
+                    L"The captured application is never opened, hooked or modified.\r\n\r\n"
+                    L"Gameplay Output puts Prism fullscreen over the game while input keeps going "
+                    L"to the game itself. The global shortcuts switch between that and an "
+                    L"interactive configuration mode.",
                     L"About Prism", MB_ICONINFORMATION | MB_OK);
         break;
     case IdExit: DestroyWindow(m_window); break;
@@ -490,13 +608,15 @@ void App::OnCommand(int commandId)
 
 void App::StartCapture()
 {
-    if(!m_bridge.IsLoaded())
+    if(!m_bridge.IsLoaded() && !m_bridge.Load())
     {
-        if(!m_bridge.Load())
-        {
-            MessageBoxW(m_window, m_bridge.LoadError().c_str(), L"Prism - Capture", MB_ICONWARNING | MB_OK);
-            return;
-        }
+        MessageBoxW(m_window, m_bridge.LoadError().c_str(), L"Prism - Capture", MB_ICONWARNING | MB_OK);
+        return;
+    }
+    if(!m_bridge.CaptureAvailable())
+    {
+        MessageBoxW(m_window, m_bridge.CaptureError().c_str(), L"Prism - Capture", MB_ICONWARNING | MB_OK);
+        return;
     }
     if(m_bridge.IsActive())
         return;
@@ -590,6 +710,225 @@ void App::ShowOutput(bool visible)
     UpdateTrayIcon();
 }
 
+
+/* --------------------------------------------------- gameplay output --- */
+
+/* Each Wayland output KDE exposes shows up here as one Windows monitor, which
+ * is how Prism can be told to go fullscreen on the NVIDIA-driven display while
+ * the game stays on the AMD-driven one. Names come from the display device, so
+ * they survive a re-plug better than an index does. */
+BOOL CALLBACK App::MonitorEnumThunk(HMONITOR monitor, HDC dc, LPRECT rect, LPARAM userData)
+{
+    App* self = reinterpret_cast<App*>(userData);
+
+    (void)dc;
+    (void)rect;
+
+    MONITORINFOEXW info {};
+    info.cbSize = sizeof(info);
+    if(!GetMonitorInfoW(monitor, &info))
+        return TRUE;
+
+    MonitorEntry entry;
+    entry.bounds  = info.rcMonitor;
+    entry.primary = (info.dwFlags & MONITORINFOF_PRIMARY) != 0;
+
+    wchar_t label[160];
+    swprintf(label, 160, L"%ls  %ldx%ld at %ld,%ld%ls", info.szDevice, info.rcMonitor.right - info.rcMonitor.left,
+             info.rcMonitor.bottom - info.rcMonitor.top, info.rcMonitor.left, info.rcMonitor.top,
+             entry.primary ? L"  (primary)" : L"");
+    entry.name = label;
+
+    self->m_monitors.push_back(std::move(entry));
+    return TRUE;
+}
+
+void App::RefreshMonitors()
+{
+    m_monitors.clear();
+    EnumDisplayMonitors(nullptr, nullptr, &App::MonitorEnumThunk, reinterpret_cast<LPARAM>(this));
+    PrismLog("display: %zu monitor(s) visible to Wine", m_monitors.size());
+}
+
+RECT App::TargetMonitorRect() const
+{
+    if(m_settings.outputMonitorIndex >= 0 &&
+       m_settings.outputMonitorIndex < static_cast<int>(m_monitors.size()))
+        return m_monitors[static_cast<size_t>(m_settings.outputMonitorIndex)].bounds;
+
+    HMONITOR    monitor = MonitorFromWindow(m_window, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFO info {};
+    info.cbSize = sizeof(info);
+    GetMonitorInfoW(monitor, &info);
+    return info.rcMonitor;
+}
+
+/*
+ * Gameplay output is a borderless fullscreen window on the chosen monitor,
+ * shown above the game and deliberately inert: WS_EX_NOACTIVATE keeps it out of
+ * the focus chain and WS_EX_TRANSPARENT lets clicks fall through to whatever is
+ * underneath, so the real keyboard and mouse keep driving the real game. Prism
+ * forwards nothing and synthesises nothing.
+ *
+ * Wine maps both flags onto its X11/Wayland windows, but a compositor is free to
+ * disagree about stacking and focus, so this is the one part of Prism that
+ * genuinely needs checking on a real KDE session rather than reasoning about.
+ */
+void App::EnterGameplayOutput()
+{
+    if(!m_window)
+        return;
+
+    RefreshMonitors();
+    m_previousForeground = GetForegroundWindow();
+    m_gameplayOutput     = true;
+
+    /* Remember where the ordinary window was, so leaving restores it. */
+    if(m_settings.windowMode == WindowMode::Windowed)
+    {
+        m_savedPlacement.length = sizeof(m_savedPlacement);
+        GetWindowPlacement(m_window, &m_savedPlacement);
+        m_savedStyle = GetWindowLongPtrW(m_window, GWL_STYLE);
+    }
+
+    SetMenu(m_window, nullptr);
+    SetWindowLongPtrW(m_window, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+
+    const RECT bounds = TargetMonitorRect();
+    SetWindowPos(m_window, m_settings.gameplayTopmost ? HWND_TOPMOST : HWND_TOP, bounds.left, bounds.top,
+                 bounds.right - bounds.left, bounds.bottom - bounds.top,
+                 SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOACTIVATE);
+
+    m_outputVisible = true;
+    SetInteractionMode(InteractionMode::Gameplay);
+
+    /* Nothing about entering the overlay should take the game's focus away. */
+    if(m_previousForeground && m_previousForeground != m_window)
+        SetForegroundWindow(m_previousForeground);
+
+    m_lastPresentUs = 0;
+    RefreshMenuChecks();
+    UpdateTrayIcon();
+    PrismLog("gameplay output on (%ldx%ld at %ld,%ld)", bounds.right - bounds.left, bounds.bottom - bounds.top,
+             bounds.left, bounds.top);
+}
+
+void App::ExitGameplayOutput()
+{
+    if(!m_gameplayOutput)
+        return;
+
+    m_gameplayOutput = false;
+    SetInteractionMode(InteractionMode::Configuration);
+
+    /* Back to whatever ordinary window mode was configured. Capture keeps
+     * running throughout: only presentation stops. */
+    ShowWindow(m_window, SW_HIDE);
+    m_outputVisible = false;
+
+    SetWindowPos(m_window, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    SetMenu(m_window, m_menuBar);
+    SetWindowLongPtrW(m_window, GWL_STYLE, m_savedStyle ? m_savedStyle : WS_OVERLAPPEDWINDOW);
+    if(m_savedPlacement.length)
+        SetWindowPlacement(m_window, &m_savedPlacement);
+
+    if(m_previousForeground && IsWindow(m_previousForeground))
+        SetForegroundWindow(m_previousForeground);
+
+    RefreshMenuChecks();
+    UpdateTrayIcon();
+    PrismLog("gameplay output off; capture continues");
+}
+
+void App::ApplyInteractionStyles()
+{
+    if(!m_window)
+        return;
+
+    LONG_PTR exStyle = GetWindowLongPtrW(m_window, GWL_EXSTYLE);
+
+    if(m_interaction == InteractionMode::Gameplay)
+    {
+        /* NOACTIVATE: never becomes the foreground window on click or show.
+         * TRANSPARENT: hit-testing falls through to the window underneath.
+         * Together they are what "watch Prism, play the game" means. */
+        exStyle |= (WS_EX_NOACTIVATE | WS_EX_TRANSPARENT);
+    }
+    else
+    {
+        exStyle &= ~(WS_EX_NOACTIVATE | WS_EX_TRANSPARENT);
+    }
+
+    SetWindowLongPtrW(m_window, GWL_EXSTYLE, exStyle);
+    SetWindowPos(m_window, nullptr, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE);
+}
+
+void App::SetInteractionMode(InteractionMode mode)
+{
+    if(m_interaction == mode)
+        return;
+
+    m_interaction = mode;
+    ApplyInteractionStyles();
+
+    if(mode == InteractionMode::Configuration)
+    {
+        /* Hand focus to Prism so ReShade's overlay can be driven. Its own
+         * hotkey (Home by default) opens it; Prism does not try to press that
+         * for the user, because faking input into ReShade is exactly the kind
+         * of fragility this mode exists to avoid. */
+        if(m_gameplayOutput)
+        {
+            m_previousForeground = GetForegroundWindow();
+            SetWindowPos(m_window, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        }
+        SetForegroundWindow(m_window);
+        SetFocus(m_window);
+        PrismLog("configuration mode: Prism is interactive, open ReShade with its overlay key");
+    }
+    else
+    {
+        /* Give the game its input back. */
+        if(m_previousForeground && IsWindow(m_previousForeground) && m_previousForeground != m_window)
+            SetForegroundWindow(m_previousForeground);
+        PrismLog("gameplay mode: input belongs to the captured application again");
+    }
+
+    RefreshMenuChecks();
+    UpdateTrayIcon();
+}
+
+void App::OnShortcut(PrismShortcut shortcut)
+{
+    switch(shortcut)
+    {
+    case PrismShortcut::ToggleMode:
+        /* Outside gameplay output the toggle just brings Prism forward, which
+         * is the sensible reading of "make Prism interactive". */
+        if(!m_gameplayOutput)
+        {
+            ShowOutput(true);
+            SetInteractionMode(InteractionMode::Configuration);
+            break;
+        }
+        SetInteractionMode(m_interaction == InteractionMode::Gameplay ? InteractionMode::Configuration
+                                                                      : InteractionMode::Gameplay);
+        break;
+
+    case PrismShortcut::HideOutput:
+        /* The escape hatch. Must work even if presentation has wedged, so it
+         * only touches window state and never the renderer. */
+        if(m_gameplayOutput)
+            ExitGameplayOutput();
+        else
+            ShowOutput(false);
+        break;
+
+    default: break;
+    }
+}
+
 /* ----------------------------------------------------------------- tray -- */
 
 void App::CreateTrayIcon()
@@ -619,7 +958,7 @@ void App::UpdateTrayIcon()
     data.uID    = 1;
     data.uFlags = NIF_TIP;
 
-    const std::wstring tip = m_diagnostics.BuildSummary(IsCapturing(), m_testPattern.IsRunning());
+    const std::wstring tip = m_diagnostics.BuildSummary(IsCapturing(), m_testPattern.IsRunning(), m_gameplayOutput);
     wcsncpy(data.szTip, tip.c_str(), ARRAYSIZE(data.szTip) - 1);
     Shell_NotifyIconW(NIM_MODIFY, &data);
 }
@@ -640,17 +979,24 @@ void App::DestroyTrayIcon()
 void App::ShowTrayMenu()
 {
     HMENU menu = CreatePopupMenu();
-    AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, m_diagnostics.BuildSummary(IsCapturing(), m_testPattern.IsRunning()).c_str());
+
+    AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, m_diagnostics.BuildSummary(IsCapturing(), m_testPattern.IsRunning(), m_gameplayOutput).c_str());
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+
     /* Both entries do the same thing on purpose: the portal grants a session
      * per selection, so starting capture always means picking a source. */
-    AppendMenuW(menu, MF_STRING | (m_bridge.IsActive() ? MF_GRAYED : 0), IdSelectSource, L"Capture Source...");
+    AppendMenuW(menu, MF_STRING | (m_bridge.IsActive() ? MF_GRAYED : 0), IdSelectSource, L"Select Capture Source...");
     AppendMenuW(menu, MF_STRING | (m_bridge.IsActive() ? MF_GRAYED : 0), IdSelectSource, L"Start Capture");
     AppendMenuW(menu, MF_STRING | (m_bridge.IsActive() ? 0 : MF_GRAYED), IdStopCapture, L"Stop Capture");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, IdShowOutput, L"Show Output");
-    AppendMenuW(menu, MF_STRING, IdHideOutput, L"Hide Output");
-    AppendMenuW(menu, MF_STRING, IdDiagnostics, L"Settings / Diagnostics...");
+
+    AppendMenuW(menu, MF_STRING | (m_gameplayOutput ? MF_GRAYED : 0), IdGameplayOutput, L"Show Gameplay Output");
+    AppendMenuW(menu, MF_STRING | (m_gameplayOutput ? 0 : MF_GRAYED), IdExitGameplay, L"Hide Gameplay Output");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+
+    AppendMenuW(menu, MF_STRING, IdShowPrism, L"Show Prism");
+    AppendMenuW(menu, MF_STRING, IdDiagnostics, L"Diagnostics...");
+    AppendMenuW(menu, MF_STRING, IdConfigureShortcuts, L"Settings: Global Shortcuts...");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, IdExit, L"Quit");
 
@@ -696,11 +1042,65 @@ void App::ToggleDiagnostics(bool visible)
     }
 }
 
+Diagnostics::ReportContext App::BuildReportContext() const
+{
+    Diagnostics::ReportContext context;
+    context.bridge         = &m_bridge;
+    context.renderer       = &m_renderer;
+    context.settings       = &m_settings;
+    context.reshade        = &m_reshade;
+    context.hotkeys        = &m_hotkeys;
+    context.testPattern    = m_testPattern.IsRunning();
+    context.gameplayOutput = m_gameplayOutput;
+    context.interaction    = m_interaction;
+    return context;
+}
+
 void App::UpdateDiagnostics()
 {
     if(!m_diagnosticsEdit || !m_settings.showDiagnostics || !IsWindowVisible(m_diagnosticsWindow))
         return;
-    SetWindowTextW(m_diagnosticsEdit, m_diagnostics.BuildReport(m_bridge, m_renderer, m_settings, m_reshade, m_testPattern.IsRunning()).c_str());
+    SetWindowTextW(m_diagnosticsEdit, m_diagnostics.BuildReport(BuildReportContext()).c_str());
+}
+
+/* The diagnostics window cannot be scrolled through a screenshot and cannot be
+ * pasted into a bug report, so the same text goes to a file on demand. This is
+ * the artefact to attach when something misbehaves on a real desktop. */
+void App::SaveDiagnosticsReport()
+{
+    const std::wstring path   = PrismModuleDirectory() + L"prism-diagnostics.txt";
+    const std::wstring report = m_diagnostics.BuildReport(BuildReportContext());
+
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    if(file == INVALID_HANDLE_VALUE)
+    {
+        PrismLog("diagnostics: could not write %ls (error %lu)", path.c_str(), GetLastError());
+        return;
+    }
+
+    /* UTF-8 without a BOM: this ends up pasted into a terminal or an issue. */
+    const int needed = WideCharToMultiByte(CP_UTF8, 0, report.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if(needed > 1)
+    {
+        std::string utf8(static_cast<size_t>(needed - 1), '\0');
+        WideCharToMultiByte(CP_UTF8, 0, report.c_str(), -1, utf8.data(), needed, nullptr, nullptr);
+        DWORD written = 0;
+        WriteFile(file, utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr);
+    }
+    CloseHandle(file);
+
+    PrismLog("diagnostics: wrote %ls", path.c_str());
+    fprintf(stderr, "----- Prism diagnostics -----\n");
+    {
+        const int bytes = WideCharToMultiByte(CP_UTF8, 0, report.c_str(), -1, nullptr, 0, nullptr, nullptr);
+        std::string utf8(static_cast<size_t>(bytes > 0 ? bytes - 1 : 0), '\0');
+        if(bytes > 1)
+            WideCharToMultiByte(CP_UTF8, 0, report.c_str(), -1, utf8.data(), bytes, nullptr, nullptr);
+        fputs(utf8.c_str(), stderr);
+    }
+    fprintf(stderr, "----- end -----\n");
+    fflush(stderr);
 }
 
 /* ------------------------------------------------------------- main loop -- */

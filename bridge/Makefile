@@ -15,8 +15,8 @@ WINEGCC ?= winegcc
 BUILDDIR ?= ../build/bridge
 OUT      := $(BUILDDIR)/PrismCapture.dll
 
-SOURCES := prism_bridge.c screencast.c pipewire.c portal.c
-HEADERS := prism_log.h screencast.h pipewire.h portal.h ../include/PrismCapture.h
+SOURCES := prism_bridge.c screencast.c pipewire.c portal.c shortcuts.c sysinfo.c
+HEADERS := prism_log.h screencast.h pipewire.h portal.h shortcuts.h sysinfo.h ../include/PrismCapture.h
 
 CFLAGS_COMMON := -m64 -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-attributes \
                  -I. -I../include $(PKG_CFLAGS)

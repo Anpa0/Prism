@@ -97,7 +97,8 @@ void TestPatternSource::Run()
             }
         }
 
-        m_mailbox->Publish(pixels.data(), m_width, m_height, m_width * 4u, PRISM_FORMAT_BGRX, ++sequence, 0, 0);
+        m_mailbox->Publish(pixels.data(), m_width, m_height, m_width * 4u, PRISM_FORMAT_BGRX, ++sequence, 0, 0,
+                           pixels.size());
 
         if(WaitForSingleObject(m_stopEvent, intervalMs ? intervalMs : 1) == WAIT_OBJECT_0)
             break;

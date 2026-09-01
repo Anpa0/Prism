@@ -26,6 +26,18 @@ void WriteInt(const wchar_t* key, int value)
     WritePrivateProfileStringW(kSection, key, buffer, IniPath().c_str());
 }
 
+std::wstring ReadString(const wchar_t* key, const wchar_t* fallback)
+{
+    wchar_t buffer[256] = {};
+    GetPrivateProfileStringW(kSection, key, fallback, buffer, 256, IniPath().c_str());
+    return buffer;
+}
+
+void WriteString(const wchar_t* key, const std::wstring& value)
+{
+    WritePrivateProfileStringW(kSection, key, value.c_str(), IniPath().c_str());
+}
+
 template<typename E> E ClampEnum(int value, int count, E fallback)
 {
     return (value >= 0 && value < count) ? static_cast<E>(value) : fallback;
@@ -56,6 +68,16 @@ void Settings::Load()
     windowHeight    = ReadInt(L"WindowHeight", 720);
     showDiagnostics = ReadInt(L"ShowDiagnostics", 0) != 0;
 
+    gameplayTopmost    = ReadInt(L"GameplayTopmost", 1) != 0;
+    outputMonitorIndex = ReadInt(L"OutputMonitorIndex", -1);
+    hotkeyToggleMode   = ReadString(L"HotkeyToggleMode", L"CTRL+SHIFT+F11");
+    hotkeyHideOutput   = ReadString(L"HotkeyHideOutput", L"CTRL+SHIFT+F12");
+
+    if(hotkeyToggleMode.empty())
+        hotkeyToggleMode = L"CTRL+SHIFT+F11";
+    if(hotkeyHideOutput.empty())
+        hotkeyHideOutput = L"CTRL+SHIFT+F12";
+
     if(sourceTypes == 0 || sourceTypes > 0x7)
         sourceTypes = 0x7;
     if(windowWidth < 320)
@@ -76,4 +98,8 @@ void Settings::Save() const
     WriteInt(L"WindowWidth", windowWidth);
     WriteInt(L"WindowHeight", windowHeight);
     WriteInt(L"ShowDiagnostics", showDiagnostics ? 1 : 0);
+    WriteInt(L"GameplayTopmost", gameplayTopmost ? 1 : 0);
+    WriteInt(L"OutputMonitorIndex", outputMonitorIndex);
+    WriteString(L"HotkeyToggleMode", hotkeyToggleMode);
+    WriteString(L"HotkeyHideOutput", hotkeyHideOutput);
 }

@@ -16,8 +16,9 @@
 #include <spa/debug/types.h>
 #include <spa/utils/defs.h>
 
-/* Prism never converts pixels, so it only ever negotiates the two layouts that
- * are byte-identical to DXGI_FORMAT_B8G8R8A8_UNORM. */
+/* BGRx/BGRA are byte-identical to DXGI_FORMAT_B8G8R8A8_UNORM and cost nothing.
+ * RGBx/RGBA are accepted as a second choice and swapped explicitly on the PE
+ * side, which is counted and shown in diagnostics rather than hidden. */
 #define PRISM_MAX_DIMENSION 16384
 
 struct prism_pw
@@ -51,6 +52,9 @@ struct prism_pw
     volatile unsigned long long throttled;
     volatile unsigned long long corrupt;
     volatile unsigned long long sequence;
+    volatile unsigned int       last_stride;
+    volatile unsigned int       last_maxsize;
+    volatile double             callback_ms;
 };
 
 static struct prism_pw pw_state;
@@ -86,11 +90,14 @@ static const struct spa_pod* prism_build_format(struct spa_pod_builder* builder)
     /* BGRx first: it is what KWin hands out for opaque sources and it needs no
      * conversion anywhere in the pipeline. The framerate range is deliberately
      * open-ended so a 240 Hz source is not clamped to 60. */
+    /* The first entry of a CHOICE_ENUM is the preferred value and is repeated
+     * as the first alternative, so BGRx wins whenever the source can offer it. */
     return spa_pod_builder_add_object(
         builder, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat, SPA_FORMAT_mediaType,
         SPA_POD_Id(SPA_MEDIA_TYPE_video), SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
-        SPA_FORMAT_VIDEO_format, SPA_POD_CHOICE_ENUM_Id(3, SPA_VIDEO_FORMAT_BGRx, SPA_VIDEO_FORMAT_BGRx,
-                                                        SPA_VIDEO_FORMAT_BGRA),
+        SPA_FORMAT_VIDEO_format,
+        SPA_POD_CHOICE_ENUM_Id(5, SPA_VIDEO_FORMAT_BGRx, SPA_VIDEO_FORMAT_BGRx, SPA_VIDEO_FORMAT_BGRA,
+                               SPA_VIDEO_FORMAT_RGBx, SPA_VIDEO_FORMAT_RGBA),
         SPA_FORMAT_VIDEO_size,
         SPA_POD_CHOICE_RANGE_Rectangle(&SPA_RECTANGLE(1920, 1080), &SPA_RECTANGLE(1, 1),
                                        &SPA_RECTANGLE(PRISM_MAX_DIMENSION, PRISM_MAX_DIMENSION)),
@@ -104,6 +111,8 @@ static unsigned int prism_map_format(uint32_t spa_format)
     {
     case SPA_VIDEO_FORMAT_BGRx: return PRISM_FORMAT_BGRX;
     case SPA_VIDEO_FORMAT_BGRA: return PRISM_FORMAT_BGRA;
+    case SPA_VIDEO_FORMAT_RGBx: return PRISM_FORMAT_RGBX;
+    case SPA_VIDEO_FORMAT_RGBA: return PRISM_FORMAT_RGBA;
     default: return 0;
     }
 }
@@ -186,12 +195,20 @@ static void on_process(void* user_data)
     struct prism_pw*        s = user_data;
     struct pw_buffer*       b;
     struct spa_buffer*      buf;
+    struct spa_data*        d;
+    struct spa_chunk*       chunk;
     struct spa_meta_region* crop;
     struct spa_meta_header* header;
     PrismFrame              frame;
+    const uint8_t*          base;
     const uint8_t*          pixels;
     unsigned int            width, height, stride;
+    unsigned long long      available;
+    unsigned long long      required;
     unsigned long long      now;
+    unsigned long long      entered;
+
+    entered = prism_now_ns();
 
     /* Drain to the newest queued buffer: PipeWire hands us a queue, and Prism
      * only ever cares about the freshest entry. Anything older is recycled
@@ -215,37 +232,84 @@ static void on_process(void* user_data)
     s->received++;
     buf = b->buffer;
 
-    if(!s->have_format || buf->n_datas < 1 || buf->datas[0].data == NULL)
+    if(!s->have_format || buf->n_datas < 1)
+    {
+        s->corrupt++;
+        goto recycle;
+    }
+
+    d     = &buf->datas[0];
+    chunk = d->chunk;
+
+    if(d->data == NULL)
     {
         /* No mapped pointer: almost always a DMA-BUF-only buffer, which v0.1
          * does not import. Recycle it rather than guessing. */
         s->corrupt++;
-        pw_stream_queue_buffer(s->stream, b);
-        return;
+        goto recycle;
     }
 
     width  = s->format.info.raw.size.width;
     height = s->format.info.raw.size.height;
-    stride = buf->datas[0].chunk ? (unsigned int)buf->datas[0].chunk->stride : width * 4u;
-    pixels = (const uint8_t*)buf->datas[0].data;
+    stride = chunk ? (unsigned int)chunk->stride : 0u;
 
-    if(stride == 0)
+    /* A negotiated format is not a promise about layout. Rows are frequently
+     * padded, and a chunk can start partway into the mapping, so every bound is
+     * derived from what this buffer actually reports and then checked. Nothing
+     * here assumes a tightly packed BGRx image. */
+    if(stride == 0u)
         stride = width * 4u;
+
+    base      = (const uint8_t*)d->data + (chunk ? chunk->offset : 0u);
+    available = d->maxsize > (chunk ? chunk->offset : 0u) ? d->maxsize - (chunk ? chunk->offset : 0u) : 0ull;
+    if(chunk && chunk->size > 0 && (unsigned long long)chunk->size < available)
+        available = chunk->size;
+
+    s->last_stride  = stride;
+    s->last_maxsize = (unsigned int)d->maxsize;
+
+    if(width == 0u || height == 0u || width > PRISM_MAX_DIMENSION || height > PRISM_MAX_DIMENSION ||
+       stride < width * 4u)
+    {
+        prism_warn("rejecting a frame with implausible geometry: %ux%u stride %u", width, height, stride);
+        s->corrupt++;
+        goto recycle;
+    }
+
+    pixels = base;
 
     crop = spa_buffer_find_meta_data(buf, SPA_META_VideoCrop, sizeof(*crop));
     if(crop && spa_meta_region_is_valid(crop) &&
        (crop->region.size.width != width || crop->region.size.height != height))
     {
-        pixels += (size_t)crop->region.position.x * 4u + (size_t)crop->region.position.y * stride;
-        width  = crop->region.size.width;
-        height = crop->region.size.height;
+        const unsigned int crop_x = crop->region.position.x;
+        const unsigned int crop_y = crop->region.position.y;
+
+        if(crop_x + crop->region.size.width > width || crop_y + crop->region.size.height > height ||
+           crop->region.size.width == 0u || crop->region.size.height == 0u)
+        {
+            prism_warn("ignoring an out-of-range crop rectangle: %ux%u at %u,%u of %ux%u",
+                       crop->region.size.width, crop->region.size.height, crop_x, crop_y, width, height);
+        }
+        else
+        {
+            const unsigned long long crop_offset = (unsigned long long)crop_x * 4ull +
+                                                   (unsigned long long)crop_y * (unsigned long long)stride;
+            pixels = base + crop_offset;
+            available = available > crop_offset ? available - crop_offset : 0ull;
+            width     = crop->region.size.width;
+            height    = crop->region.size.height;
+        }
     }
 
-    if(width == 0 || height == 0 || width > PRISM_MAX_DIMENSION || height > PRISM_MAX_DIMENSION)
+    /* The last row only needs its visible pixels, not a full padded stride. */
+    required = (unsigned long long)(height - 1u) * (unsigned long long)stride + (unsigned long long)width * 4ull;
+    if(required > available)
     {
+        prism_warn("rejecting a short frame: %ux%u stride %u needs %llu bytes, buffer offers %llu", width, height,
+                   stride, required, available);
         s->corrupt++;
-        pw_stream_queue_buffer(s->stream, b);
-        return;
+        goto recycle;
     }
 
     now = prism_now_ns();
@@ -256,26 +320,28 @@ static void on_process(void* user_data)
     if(s->min_interval_ns != 0 && s->last_delivery_ns != 0 && now - s->last_delivery_ns < s->min_interval_ns)
     {
         s->throttled++;
-        pw_stream_queue_buffer(s->stream, b);
-        return;
+        goto recycle;
     }
     s->last_delivery_ns = now;
 
-    header      = spa_buffer_find_meta_data(buf, SPA_META_Header, sizeof(*header));
-    frame.data  = pixels;
-    frame.width = width;
-    frame.height   = height;
-    frame.pitch    = stride;
-    frame.format   = prism_map_format(s->format.info.raw.format);
-    frame.pts_ns   = (header && header->pts > 0) ? (unsigned long long)header->pts : 0ull;
-    frame.recv_ns  = now;
-    frame.sequence = ++s->sequence;
+    header          = spa_buffer_find_meta_data(buf, SPA_META_Header, sizeof(*header));
+    frame.data      = pixels;
+    frame.width     = width;
+    frame.height    = height;
+    frame.pitch     = stride;
+    frame.format    = prism_map_format(s->format.info.raw.format);
+    frame.pts_ns    = (header && header->pts > 0) ? (unsigned long long)header->pts : 0ull;
+    frame.recv_ns   = now;
+    frame.sequence  = ++s->sequence;
+    frame.data_size = available;
 
     if(s->cb.on_frame)
         s->cb.on_frame(&frame);
     s->delivered++;
 
+recycle:
     pw_stream_queue_buffer(s->stream, b);
+    s->callback_ms = (double)(prism_now_ns() - entered) / 1000000.0;
 }
 
 /* ---------------------------------------------------------------- public -- */
@@ -395,4 +461,14 @@ void prism_pipewire_get_counters(unsigned long long* received, unsigned long lon
         *throttled = pw_state.throttled;
     if(corrupt)
         *corrupt = pw_state.corrupt;
+}
+
+void prism_pipewire_get_layout(unsigned int* stride, unsigned int* maxsize, double* callback_ms)
+{
+    if(stride)
+        *stride = pw_state.last_stride;
+    if(maxsize)
+        *maxsize = pw_state.last_maxsize;
+    if(callback_ms)
+        *callback_ms = pw_state.callback_ms;
 }

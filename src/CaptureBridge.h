@@ -24,9 +24,17 @@ class CaptureBridge
 public:
     ~CaptureBridge();
 
+    /* Maps the module and resolves its exports. Succeeding here is enough for
+     * global shortcuts and system introspection; capture additionally needs the
+     * ScreenCast portal, which CaptureAvailable() reports separately. Keeping
+     * the two apart matters: a session with no ScreenCast backend should still
+     * get working hotkeys. */
     bool Load();
-    bool IsLoaded() const { return m_ready; }
+    bool IsLoaded() const { return m_loaded; }
+    bool CaptureAvailable() const { return m_captureReady; }
+
     const std::wstring& LoadError() const { return m_loadError; }
+    const std::wstring& CaptureError() const { return m_captureError; }
 
     bool Start(unsigned sourceTypes, bool captureCursor, unsigned maxFps);
     void Stop();
@@ -39,6 +47,17 @@ public:
     const FrameMailbox& Mailbox() const { return m_mailbox; }
 
     PrismBridgeStats Stats() const;
+
+    /* Global shortcuts, forwarded to the XDG GlobalShortcuts portal. */
+    bool         StartShortcuts(const PrismShortcutSpec* shortcuts, unsigned count,
+                                PrismShortcutCallback callback, void* context);
+    void         StopShortcuts();
+    void         ConfigureShortcuts();
+    unsigned     ShortcutState(char* message, unsigned messageBytes) const;
+    unsigned     ShortcutBindings(PrismShortcutBinding* out, unsigned max) const;
+
+    /* Linux GPU and session facts Prism.exe cannot see through DXGI. */
+    bool QuerySystemInfo(PrismSystemInfo& out) const;
 
     /* Latest status pushed by the bridge, in UTF-16 for the UI. */
     unsigned     State() const { return m_state.load(std::memory_order_relaxed); }
@@ -61,10 +80,19 @@ private:
     using SetMaxFpsFn = void(__stdcall*)(unsigned);
     using GetStatsFn  = void(__stdcall*)(PrismBridgeStats*);
     using ShutdownFn  = void(__stdcall*)();
+    using ShortcutsStartFn       = long(__stdcall*)(const PrismShortcutSpec*, unsigned, PrismShortcutCallback,
+                                             void*);
+    using ShortcutsStatusFn      = unsigned(__stdcall*)(char*, unsigned);
+    using ShortcutsBindingsFn    = unsigned(__stdcall*)(PrismShortcutBinding*, unsigned);
+    using ShortcutsConfigureFn   = void(__stdcall*)();
+    using ShortcutsStopFn        = void(__stdcall*)();
+    using SystemInfoQueryFn      = void(__stdcall*)(PrismSystemInfo*);
 
-    HMODULE      m_module = nullptr;
-    bool         m_ready  = false;
+    HMODULE      m_module       = nullptr;
+    bool         m_loaded       = false;
+    bool         m_captureReady = false;
     std::wstring m_loadError;
+    std::wstring m_captureError;
 
     VersionFn   m_version   = nullptr;
     InitFn      m_init      = nullptr;
@@ -73,6 +101,13 @@ private:
     SetMaxFpsFn m_setMaxFps = nullptr;
     GetStatsFn  m_getStats  = nullptr;
     ShutdownFn  m_shutdown  = nullptr;
+
+    ShortcutsStartFn     m_shortcutsStart     = nullptr;
+    ShortcutsStatusFn    m_shortcutsStatus    = nullptr;
+    ShortcutsBindingsFn  m_shortcutsBindings  = nullptr;
+    ShortcutsConfigureFn m_shortcutsConfigure = nullptr;
+    ShortcutsStopFn      m_shortcutsStop      = nullptr;
+    SystemInfoQueryFn    m_systemInfoQuery    = nullptr;
 
     FrameMailbox          m_mailbox;
     std::atomic<bool>     m_active {false};

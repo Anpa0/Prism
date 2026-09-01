@@ -1,6 +1,6 @@
 # Prism
 
-A screen-capture host for Proton/Wine, with ReShade support.
+A Windows/Proton screen-capture host for Linux, with ReShade support.
 
 Prism is a Windows application that runs under Proton or Wine on Linux. It
 captures a Linux window, game window, monitor or the whole desktop through the
@@ -28,13 +28,14 @@ Captured game / application
         │
       ReShade                      (attached to Prism.exe, nothing else)
         │
-   Prism's window
+   Prism's window                  (or fullscreen gameplay output over the game)
 ```
 
 ## What Prism is not
 
-Prism is only a capture host. It does not record, encode, stream, buffer clips,
-capture audio, upscale, generate frames, or do any kind of AI processing.
+Prism is only a capture host. It does not record to disk, encode, stream, buffer
+clips, capture audio, upscale, generate frames, or do any kind of AI processing.
+It is a live capture-and-presentation application, not a recorder.
 
 It also never touches the application it is capturing. There is no injection, no
 API hooking, no process or memory access, and nothing is installed into a game's
@@ -62,23 +63,74 @@ To check the renderer and ReShade before wiring up capture at all:
 ./scripts/run-prism.sh --test-pattern
 ```
 
+## Playing while watching Prism
+
+**Display → Gameplay Output** puts Prism borderless-fullscreen over the game,
+on top and click-through, so the keyboard and mouse keep driving the game.
+
+| Key | Action |
+| --- | --- |
+| `Ctrl+Shift+F11` | Toggle gameplay ↔ configuration mode (configuration makes Prism interactive for ReShade) |
+| `Ctrl+Shift+F12` | Hide the gameplay output immediately; capture keeps running |
+
+Both arrive through the XDG GlobalShortcuts portal, so they fire while the game
+has focus. One-time setup:
+
+```sh
+./scripts/install-desktop-file.sh
+```
+
+## Two GPUs
+
+Prism can render on a second GPU while the game stays on the first, because the
+ScreenCast stream is the only thing between them — Prism never touches the
+game's device.
+
+```sh
+./scripts/check-gpus.sh                    # read-only report
+./scripts/configure-gpu-policy.sh          # --status first; --apply pins KWin to AMD
+./scripts/run-prism.sh --gpu nvidia        # Prism only, this launch only
+```
+
+None of it is required: with one GPU, Prism runs on it with no configuration.
+
 ## Documentation
 
 | Document | Contents |
 | --- | --- |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design, the D3D11 vs D3D12 decision, how `Prism.exe` talks to the native `.so`, PipeWire and portal integration, latest-frame semantics |
-| [docs/BUILDING.md](docs/BUILDING.md) | Directory layout, dependencies, build system, Fedora instructions |
-| [docs/RUNNING.md](docs/RUNNING.md) | Launching under Wine and under Proton, environment variables, settings |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design, the D3D11 decision, how `Prism.exe` talks to the native `.so`, portal integration, latest-frame semantics, gameplay/configuration modes |
+| [docs/FEDORA_SETUP.md](docs/FEDORA_SETUP.md) | Fedora/KDE prerequisites, NVIDIA Blackwell driver install, Secure Boot, PCIe checks |
+| [docs/GPU_POLICY.md](docs/GPU_POLICY.md) | Keeping the session on AMD and Prism opt-in on NVIDIA |
+| [docs/MULTI_GPU.md](docs/MULTI_GPU.md) | The dual-GPU topology, adapter selection, display output, OCuLink bandwidth |
+| [docs/PROTON.md](docs/PROTON.md) | Adding Prism to Steam, launch options, prefix layout |
+| [docs/HOTKEYS.md](docs/HOTKEYS.md) | Global shortcuts, the portal app-id requirement, troubleshooting |
 | [docs/RESHADE.md](docs/RESHADE.md) | ReShade installation and configuration |
-| [docs/TESTING.md](docs/TESTING.md) | Test procedure, including the isolation check |
+| [docs/BUILDING.md](docs/BUILDING.md) | Directory layout, dependencies, build system |
+| [docs/RUNNING.md](docs/RUNNING.md) | Launching under Wine and Proton, menus, settings |
+| [docs/TESTING.md](docs/TESTING.md) | Phase-by-phase test procedure, including the isolation check |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | Performance-optimisation roadmap (DMA-BUF and friends) |
+
+## Reporting a problem
+
+```sh
+./scripts/run-prism.sh --dump-diagnostics
+```
+
+writes `build/dist/prism-diagnostics.txt` — capture state, negotiated format and
+stride, frame accounting, per-stage timings, the DXGI adapter in use, ReShade
+detection, global-shortcut state, and every GPU the bridge found with its PCI
+address, driver and PCIe link. Attach that, plus `./scripts/check-gpus.sh`.
 
 ## Status
 
-Version 0.1. The bring-up path — bridge load, portal session, PipeWire stream,
-latest-frame mailbox, D3D11 present, ReShade attach, diagnostics, tray — is
-implemented. Frame transport is CPU-side by design for this version; see the
-roadmap for the zero-copy work that follows.
+Version 0.2. Implemented: bridge load, ScreenCast portal session, PipeWire
+stream with full buffer validation, latest-frame mailbox, D3D11 present with
+format-matched textures, ReShade attach, fullscreen gameplay output with
+click-through input, global shortcuts through the GlobalShortcuts portal,
+explicit GPU selection, monitor targeting, tray operation and diagnostics.
+
+Frame transport is CPU-side by design for this version; see the roadmap for the
+zero-copy work that follows.
 
 ## Licence
 

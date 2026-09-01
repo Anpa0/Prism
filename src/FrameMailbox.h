@@ -41,9 +41,20 @@ public:
     FrameMailbox();
     ~FrameMailbox();
 
-    /* Capture thread. Copies `pixels` into the producer buffer and publishes. */
+    /* Capture thread. Copies `pixels` into the producer buffer and publishes.
+     * `dataSize` is what the bridge says is readable at `pixels`; the copy is
+     * refused rather than clamped when the geometry does not fit inside it. */
     void Publish(const void* pixels, uint32_t width, uint32_t height, uint32_t pitch, uint32_t format,
-                 uint64_t sequence, uint64_t ptsNs, uint64_t bridgeRecvNs);
+                 uint64_t sequence, uint64_t ptsNs, uint64_t bridgeRecvNs, uint64_t dataSize);
+
+    /* Enables the CPU channel swap for RGBx/RGBA sources. Only needed in the
+     * shader-free fallback path, where the blit cannot reorder channels; the
+     * normal path matches the texture format to the source instead. */
+    void SetSwizzleRgbToBgr(bool enable) { m_swizzle.store(enable, std::memory_order_relaxed); }
+    double SwizzleMs() const { return m_swizzleMs.load(std::memory_order_relaxed); }
+
+    /* Frames refused because their geometry did not fit the reported buffer. */
+    uint64_t RejectedFrames() const { return m_rejected.load(std::memory_order_relaxed); }
 
     /* Render thread. Returns the newest unseen frame, or nullptr if there is
      * nothing new. The pointer stays valid until the next Acquire(). */
@@ -67,4 +78,7 @@ private:
     HANDLE                m_event = nullptr;
     std::atomic<uint64_t> m_staleDrops {0};
     std::atomic<uint64_t> m_published {0};
+    std::atomic<uint64_t> m_rejected {0};
+    std::atomic<bool>     m_swizzle {false};
+    std::atomic<double>   m_swizzleMs {0.0};
 };

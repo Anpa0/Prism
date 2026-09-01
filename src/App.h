@@ -8,6 +8,7 @@
 #include "CaptureBridge.h"
 #include "Common.h"
 #include "Diagnostics.h"
+#include "Hotkeys.h"
 #include "Renderer.h"
 #include "Settings.h"
 #include "TestPattern.h"
@@ -38,6 +39,17 @@ private:
     void ApplyWindowMode(WindowMode mode);
     void ShowOutput(bool visible);
 
+    /* Gameplay output: fullscreen on the chosen monitor, on top of the game. */
+    void EnterGameplayOutput();
+    void ExitGameplayOutput();
+    void SetInteractionMode(InteractionMode mode);
+    void ApplyInteractionStyles();
+    void OnShortcut(PrismShortcut shortcut);
+
+    void                    RefreshMonitors();
+    RECT                    TargetMonitorRect() const;
+    static BOOL CALLBACK    MonitorEnumThunk(HMONITOR monitor, HDC dc, LPRECT rect, LPARAM userData);
+
     void CreateTrayIcon();
     void UpdateTrayIcon();
     void DestroyTrayIcon();
@@ -45,6 +57,8 @@ private:
 
     void ToggleDiagnostics(bool visible);
     void UpdateDiagnostics();
+    Diagnostics::ReportContext BuildReportContext() const;
+    void                       SaveDiagnosticsReport();
 
     void PumpMessages();
     void RenderOnce();
@@ -62,13 +76,28 @@ private:
     Diagnostics   m_diagnostics;
     ReShadeInfo   m_reshade;
     TestPatternSource m_testPattern;
+    Hotkeys           m_hotkeys;
 
     std::vector<AdapterInfo> m_adapters;
+
+    struct MonitorEntry
+    {
+        RECT         bounds {};
+        std::wstring name;
+        bool         primary = false;
+    };
+    std::vector<MonitorEntry> m_monitors;
+
+    InteractionMode m_interaction    = InteractionMode::Configuration;
+    bool            m_gameplayOutput = false;
+    HWND            m_previousForeground = nullptr;
 
     bool     m_running        = true;
     bool     m_outputVisible  = true;
     bool     m_trayIconAdded  = false;
     bool     m_testPatternRequested = false;
+    bool     m_gameplayRequested    = false;
+    bool     m_dumpDiagnostics      = false;
     uint64_t m_lastPresentUs  = 0;
 
     WINDOWPLACEMENT m_savedPlacement {};

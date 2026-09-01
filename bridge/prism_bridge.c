@@ -17,6 +17,8 @@
 #include "PrismCapture.h"
 #include "screencast.h"
 #include "pipewire.h"
+#include "shortcuts.h"
+#include "sysinfo.h"
 
 static struct
 {
@@ -36,6 +38,9 @@ static struct
     volatile unsigned int source_format;
     volatile unsigned int source_fps_num;
     volatile unsigned int source_fps_den;
+
+    PrismShortcutCallback on_shortcut;
+    void*                 shortcut_context;
 } bridge;
 
 /* --------------------------------------------------- capture-thread side -- */
@@ -198,12 +203,73 @@ void __stdcall PrismCaptureGetStats(PrismBridgeStats* out)
     out->source_fps_num = bridge.source_fps_num;
     out->source_fps_den = bridge.source_fps_den;
     out->state          = (unsigned int)bridge.state;
+    out->needs_swizzle =
+        (bridge.source_format == PRISM_FORMAT_RGBX || bridge.source_format == PRISM_FORMAT_RGBA) ? 1u : 0u;
+    prism_pipewire_get_layout(&out->source_stride, &out->source_max_size, &out->callback_ms);
+}
+
+/* ---------------------------------------------------- global shortcuts -- */
+
+static void bridge_on_shortcut(const char* shortcut_id)
+{
+    PrismShortcutCallback callback = bridge.on_shortcut;
+
+    if(callback)
+        callback(shortcut_id, bridge.shortcut_context);
+}
+
+long __stdcall PrismShortcutsStart(const PrismShortcutSpec* shortcuts, unsigned int count,
+                                   PrismShortcutCallback on_activated, void* context)
+{
+    if(!shortcuts || count == 0)
+        return E_INVALIDARG;
+
+    bridge.on_shortcut      = on_activated;
+    bridge.shortcut_context = context;
+
+    /* The shortcuts conversation runs on the same GLib loop as ScreenCast, so
+     * the capture thread has to exist first. */
+    if(ensure_capture_thread() < 0)
+        return E_FAIL;
+
+    prism_shortcuts_start(shortcuts, count, bridge_on_shortcut);
+    return S_OK;
+}
+
+unsigned int __stdcall PrismShortcutsGetStatus(char* message, unsigned int message_bytes)
+{
+    return prism_shortcuts_status(message, message_bytes);
+}
+
+unsigned int __stdcall PrismShortcutsGetBindings(PrismShortcutBinding* out, unsigned int max)
+{
+    return prism_shortcuts_bindings(out, max);
+}
+
+void __stdcall PrismShortcutsConfigure(void)
+{
+    prism_shortcuts_configure();
+}
+
+void __stdcall PrismShortcutsStop(void)
+{
+    bridge.on_shortcut = NULL;
+    prism_shortcuts_stop();
+}
+
+/* ------------------------------------------------- Linux system probing -- */
+
+void __stdcall PrismSystemInfoQuery(PrismSystemInfo* out)
+{
+    prism_sysinfo_query(out);
 }
 
 void __stdcall PrismCaptureShutdown(void)
 {
     if(InterlockedCompareExchange(&bridge.active, 1, 1))
         PrismCaptureStop();
+
+    PrismShortcutsStop();
 
     prism_screencast_quit();
 

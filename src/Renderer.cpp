@@ -5,6 +5,8 @@
 
 #include "Renderer.h"
 
+#include "PrismCapture.h"
+
 #include <d3dcompiler.h>
 #include <algorithm>
 #include <cmath>
@@ -99,6 +101,22 @@ Renderer::~Renderer()
     Shutdown();
 }
 
+/* One place that turns a DXGI_ADAPTER_DESC1 into Prism's own record, so the
+ * menu, the diagnostics panel and the active-device report never disagree. */
+static AdapterInfo DescribeAdapter(const DXGI_ADAPTER_DESC1& desc)
+{
+    AdapterInfo info;
+    info.description           = desc.Description;
+    info.vendorId              = desc.VendorId;
+    info.deviceId              = desc.DeviceId;
+    info.dedicatedVideoMemory  = desc.DedicatedVideoMemory;
+    info.dedicatedSystemMemory = desc.DedicatedSystemMemory;
+    info.sharedSystemMemory    = desc.SharedSystemMemory;
+    info.luid                  = desc.AdapterLuid;
+    info.isSoftware            = (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
+    return info;
+}
+
 std::vector<AdapterInfo> Renderer::EnumerateAdapters()
 {
     std::vector<AdapterInfo> adapters;
@@ -113,13 +131,7 @@ std::vector<AdapterInfo> Renderer::EnumerateAdapters()
         if(FAILED(adapter->GetDesc1(&desc)))
             continue;
 
-        AdapterInfo info;
-        info.description = desc.Description;
-        info.vendorId    = desc.VendorId;
-        info.deviceId    = desc.DeviceId;
-        info.luid        = desc.AdapterLuid;
-        info.isSoftware  = (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
-        adapters.push_back(std::move(info));
+        adapters.push_back(DescribeAdapter(desc));
     }
     return adapters;
 }
@@ -191,7 +203,10 @@ bool Renderer::CreateDeviceAndSwapChain(int adapterIndex)
 
     DXGI_ADAPTER_DESC1 desc {};
     if(adapter && SUCCEEDED(adapter->GetDesc1(&desc)))
-        m_adapterDescription = desc.Description;
+    {
+        m_activeAdapter      = DescribeAdapter(desc);
+        m_adapterDescription = m_activeAdapter.description;
+    }
 
     const UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
     const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1,
@@ -272,8 +287,12 @@ bool Renderer::CreateDeviceAndSwapChain(int adapterIndex)
     m_backBufferWidth  = width;
     m_backBufferHeight = height;
 
-    PrismLog("renderer: D3D11 device on '%ls' (feature level 0x%x, flip=%d, tearing=%d)",
-             m_adapterDescription.c_str(), obtained, m_flipModel ? 1 : 0, m_allowTearing ? 1 : 0);
+    PrismLog("renderer: D3D11 device on '%ls' [%ls %04x:%04x, %llu MB VRAM] "
+             "(feature level 0x%x, flip=%d, tearing=%d)",
+             m_adapterDescription.c_str(), m_activeAdapter.VendorName(), m_activeAdapter.vendorId,
+             m_activeAdapter.deviceId,
+             (unsigned long long)(m_activeAdapter.dedicatedVideoMemory / (1024ull * 1024ull)), obtained,
+             m_flipModel ? 1 : 0, m_allowTearing ? 1 : 0);
     return true;
 }
 
@@ -391,9 +410,9 @@ void Renderer::OnResize(UINT width, UINT height)
     CreateBackBufferViews();
 }
 
-bool Renderer::EnsureSourceTexture(UINT width, UINT height)
+bool Renderer::EnsureSourceTexture(UINT width, UINT height, DXGI_FORMAT format)
 {
-    if(m_sourceTexture && width == m_sourceWidth && height == m_sourceHeight)
+    if(m_sourceTexture && width == m_sourceWidth && height == m_sourceHeight && format == m_sourceFormat)
         return true;
 
     m_sourceView.Reset();
@@ -404,7 +423,7 @@ bool Renderer::EnsureSourceTexture(UINT width, UINT height)
     desc.Height             = height;
     desc.MipLevels          = 1;
     desc.ArraySize          = 1;
-    desc.Format             = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.Format             = format;
     desc.SampleDesc.Count   = 1;
     desc.Usage              = D3D11_USAGE_DYNAMIC;
     desc.BindFlags          = D3D11_BIND_SHADER_RESOURCE;
@@ -424,7 +443,9 @@ bool Renderer::EnsureSourceTexture(UINT width, UINT height)
 
     m_sourceWidth  = width;
     m_sourceHeight = height;
-    PrismLog("renderer: capture texture is now %ux%u", width, height);
+    m_sourceFormat = format;
+    PrismLog("renderer: capture texture is now %ux%u %s", width, height,
+             format == DXGI_FORMAT_R8G8B8A8_UNORM ? "R8G8B8A8" : "B8G8R8A8");
     return true;
 }
 
@@ -435,7 +456,29 @@ bool Renderer::UploadFrame(const CapturedFrame& frame)
 
     const uint64_t started = PrismNowUs();
 
-    if(!EnsureSourceTexture(frame.width, frame.height))
+    /* Rather than converting RGBx to BGRx, Prism gives Direct3D a texture whose
+     * channel order already matches the source. The sampler then returns the
+     * same RGB either way, so neither the CPU nor the GPU touches a pixel.
+     *
+     * The one exception is the shader-free fallback: CopySubresourceRegion
+     * cannot cross format families, so an RGBx source is swapped on the CPU by
+     * the mailbox and arrives here as BGRA. */
+    DXGI_FORMAT format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    m_pixelPath        = PixelPath::DirectBgra;
+    if(frame.format == PRISM_FORMAT_RGBX || frame.format == PRISM_FORMAT_RGBA)
+    {
+        if(m_pixelShader)
+        {
+            format      = DXGI_FORMAT_R8G8B8A8_UNORM;
+            m_pixelPath = PixelPath::DirectRgba;
+        }
+        else
+        {
+            m_pixelPath = PixelPath::CpuSwizzle;
+        }
+    }
+
+    if(!EnsureSourceTexture(frame.width, frame.height, format))
         return false;
 
     D3D11_MAPPED_SUBRESOURCE mapped {};

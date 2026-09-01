@@ -24,7 +24,7 @@ CaptureBridge::~CaptureBridge()
 
 bool CaptureBridge::Load()
 {
-    if(m_ready)
+    if(m_loaded)
         return true;
     if(m_module)
         return false; /* mapped but unusable; the error is already recorded */
@@ -55,7 +55,16 @@ bool CaptureBridge::Load()
     m_getStats  = PrismResolveProc<GetStatsFn>(m_module, "PrismCaptureGetStats");
     m_shutdown  = PrismResolveProc<ShutdownFn>(m_module, "PrismCaptureShutdown");
 
-    if(!m_version || !m_init || !m_start || !m_stop || !m_setMaxFps || !m_getStats || !m_shutdown)
+    m_shortcutsStart     = PrismResolveProc<ShortcutsStartFn>(m_module, "PrismShortcutsStart");
+    m_shortcutsStatus    = PrismResolveProc<ShortcutsStatusFn>(m_module, "PrismShortcutsGetStatus");
+    m_shortcutsBindings  = PrismResolveProc<ShortcutsBindingsFn>(m_module, "PrismShortcutsGetBindings");
+    m_shortcutsConfigure = PrismResolveProc<ShortcutsConfigureFn>(m_module, "PrismShortcutsConfigure");
+    m_shortcutsStop      = PrismResolveProc<ShortcutsStopFn>(m_module, "PrismShortcutsStop");
+    m_systemInfoQuery    = PrismResolveProc<SystemInfoQueryFn>(m_module, "PrismSystemInfoQuery");
+
+    if(!m_version || !m_init || !m_start || !m_stop || !m_setMaxFps || !m_getStats || !m_shutdown ||
+       !m_shortcutsStart || !m_shortcutsStatus || !m_shortcutsBindings || !m_shortcutsConfigure ||
+       !m_shortcutsStop || !m_systemInfoQuery)
     {
         m_loadError = L"PrismCapture.dll is missing exports - it does not match this build of Prism.exe.";
         FreeLibrary(m_module); /* safe: nothing in the bridge has run yet */
@@ -75,20 +84,26 @@ bool CaptureBridge::Load()
         return false;
     }
 
+    /* The module is usable from here on, whatever the portal situation is.
+     * Note it is never unloaded once any of it has run: PrismCaptureInit()
+     * reaches GLib, and GDBus starts a worker thread the moment it touches the
+     * session bus, so pulling the shared object out from under that thread
+     * faults the process. */
+    m_loaded = true;
+    m_loadError.clear();
+
     if(m_init() != S_OK)
     {
-        m_loadError = L"The XDG ScreenCast portal is not available in this session. "
-                      L"Check that xdg-desktop-portal and its KDE backend are running.";
-        /* Deliberately not unloaded. PrismCaptureInit() reaches GLib, and GDBus
-         * starts a worker thread the moment it touches the session bus; pulling
-         * the shared object out from under that thread faults the process. The
-         * module stays mapped and inert, and m_ready keeps Prism from using it. */
-        m_ready = false;
-        return false;
+        m_captureReady = false;
+        m_captureError = L"The XDG ScreenCast portal is not available in this session. "
+                         L"Check that xdg-desktop-portal and its KDE backend are running. "
+                         L"Global shortcuts and diagnostics still work.";
+        PrismLog("bridge: loaded, but ScreenCast is unavailable - capture disabled");
+        return true;
     }
 
-    m_ready = true;
-    m_loadError.clear();
+    m_captureReady = true;
+    m_captureError.clear();
     PrismLog("bridge: PrismCapture.dll loaded, ABI %u", abi);
     return true;
 }
@@ -118,7 +133,7 @@ void CaptureBridge::OnFrame(const PrismFrame* frame)
      * Direct3D is never touched from here, which keeps the device free of
      * cross-thread traffic and keeps ReShade's view of the renderer simple. */
     m_mailbox.Publish(frame->data, frame->width, frame->height, frame->pitch, frame->format, frame->sequence,
-                      frame->pts_ns, frame->recv_ns);
+                      frame->pts_ns, frame->recv_ns, frame->data_size);
 }
 
 void CaptureBridge::OnStatus(unsigned state, const char* message)
@@ -139,7 +154,7 @@ void CaptureBridge::OnStatus(unsigned state, const char* message)
 
 bool CaptureBridge::Start(unsigned sourceTypes, bool captureCursor, unsigned maxFps)
 {
-    if(!m_ready || m_active.load(std::memory_order_relaxed))
+    if(!m_captureReady || m_active.load(std::memory_order_relaxed))
         return false;
 
     m_mailbox.ResetCounters();
@@ -159,7 +174,7 @@ bool CaptureBridge::Start(unsigned sourceTypes, bool captureCursor, unsigned max
 
 void CaptureBridge::Stop()
 {
-    if(!m_ready)
+    if(!m_captureReady)
         return;
     m_active.store(false, std::memory_order_relaxed);
     m_stop();
@@ -168,7 +183,7 @@ void CaptureBridge::Stop()
 
 void CaptureBridge::SetMaxFps(unsigned maxFps)
 {
-    if(m_ready)
+    if(m_captureReady)
         m_setMaxFps(maxFps);
 }
 
@@ -177,9 +192,14 @@ void CaptureBridge::Shutdown()
     if(!m_module)
         return;
     m_active.store(false, std::memory_order_relaxed);
-    if(m_ready)
+    if(m_loaded)
+    {
+        if(m_shortcutsStop)
+            m_shortcutsStop();
         m_shutdown();
-    m_ready = false;
+    }
+    m_loaded       = false;
+    m_captureReady = false;
     /* Same reasoning as in Load(): the bridge is left mapped. It owns a GLib
      * main loop and a GDBus worker, and the process is on its way out anyway. */
     m_module = nullptr;
@@ -188,9 +208,56 @@ void CaptureBridge::Shutdown()
 PrismBridgeStats CaptureBridge::Stats() const
 {
     PrismBridgeStats stats {};
-    if(m_ready && m_getStats)
+    if(m_captureReady && m_getStats)
         m_getStats(&stats);
     return stats;
+}
+
+bool CaptureBridge::StartShortcuts(const PrismShortcutSpec* shortcuts, unsigned count,
+                                   PrismShortcutCallback callback, void* context)
+{
+    if(!m_loaded || !m_shortcutsStart)
+        return false;
+    return m_shortcutsStart(shortcuts, count, callback, context) == S_OK;
+}
+
+void CaptureBridge::StopShortcuts()
+{
+    if(m_loaded && m_shortcutsStop)
+        m_shortcutsStop();
+}
+
+void CaptureBridge::ConfigureShortcuts()
+{
+    if(m_loaded && m_shortcutsConfigure)
+        m_shortcutsConfigure();
+}
+
+unsigned CaptureBridge::ShortcutState(char* message, unsigned messageBytes) const
+{
+    if(!m_loaded || !m_shortcutsStatus)
+    {
+        if(message && messageBytes)
+            message[0] = '\0';
+        return PRISM_SHORTCUTS_UNAVAILABLE;
+    }
+    return m_shortcutsStatus(message, messageBytes);
+}
+
+unsigned CaptureBridge::ShortcutBindings(PrismShortcutBinding* out, unsigned max) const
+{
+    if(!m_loaded || !m_shortcutsBindings)
+        return 0;
+    return m_shortcutsBindings(out, max);
+}
+
+bool CaptureBridge::QuerySystemInfo(PrismSystemInfo& out) const
+{
+    memset(&out, 0, sizeof(out));
+    if(!m_loaded || !m_systemInfoQuery)
+        return false;
+    m_systemInfoQuery(&out);
+    return true;
 }
 
 std::wstring CaptureBridge::StatusMessage() const

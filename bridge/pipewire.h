@@ -38,4 +38,8 @@ void prism_pipewire_set_max_fps(unsigned int max_fps);
 void prism_pipewire_get_counters(unsigned long long* received, unsigned long long* delivered,
                                  unsigned long long* throttled, unsigned long long* corrupt);
 
+/* Layout of the most recent buffer, for the diagnostics panel: negotiated
+ * stride, the PipeWire mapping size, and how long the last callback took. */
+void prism_pipewire_get_layout(unsigned int* stride, unsigned int* maxsize, double* callback_ms);
+
 #endif /* PRISM_PIPEWIRE_H */

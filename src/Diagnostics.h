@@ -10,6 +10,7 @@
 #include "Settings.h"
 
 class CaptureBridge;
+class Hotkeys;
 
 /* What Prism knows about the ReShade installation sitting next to Prism.exe. */
 struct ReShadeInfo
@@ -45,11 +46,22 @@ public:
     void   NoteCaptureLatency(double ms) { m_captureLatencyMs = ms; }
 
     /* Multi-line report shown in the diagnostics window. */
-    std::wstring BuildReport(const CaptureBridge& bridge, const Renderer& renderer, const Settings& settings,
-                             const ReShadeInfo& reshade, bool testPattern) const;
+    struct ReportContext
+    {
+        const CaptureBridge* bridge     = nullptr;
+        const Renderer*      renderer   = nullptr;
+        const Settings*      settings   = nullptr;
+        const ReShadeInfo*   reshade    = nullptr;
+        const Hotkeys*       hotkeys    = nullptr;
+        bool                 testPattern     = false;
+        bool                 gameplayOutput  = false;
+        InteractionMode      interaction     = InteractionMode::Configuration;
+    };
+
+    std::wstring BuildReport(const ReportContext& context) const;
 
     /* One-line summary for the title bar and the tray tooltip. */
-    std::wstring BuildSummary(bool capturing, bool testPattern) const;
+    std::wstring BuildSummary(bool capturing, bool testPattern, bool gameplayOutput = false) const;
 
 private:
     static double UpdateRate(uint64_t nowUs, uint64_t& windowStartUs, unsigned& counter, double& rate);

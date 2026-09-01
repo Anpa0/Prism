@@ -22,6 +22,21 @@ enum class WindowMode
     Fullscreen = 2,
 };
 
+/*
+ * What Prism's output window does about input.
+ *
+ * Gameplay      - fullscreen over the game, visually on top, but non-activating
+ *                 and click-through: the keyboard and mouse keep driving the
+ *                 real game underneath.
+ * Configuration - an ordinary interactive window, so ReShade's overlay can be
+ *                 used. The game loses focus for as long as this lasts.
+ */
+enum class InteractionMode
+{
+    Gameplay      = 0,
+    Configuration = 1,
+};
+
 /* Frame-rate ceilings offered in the menu. 0 means "match source": Prism
  * consumes every frame PipeWire produces and never fabricates one. */
 inline constexpr unsigned kFpsCeilings[] = {0, 30, 60, 90, 120, 144, 165, 240};
@@ -39,6 +54,12 @@ struct Settings
     int         windowWidth  = 1280;
     int         windowHeight = 720;
     bool        showDiagnostics = false;
+
+    /* Gameplay output */
+    bool         gameplayTopmost = true;
+    int          outputMonitorIndex = -1; /* -1 = whichever monitor holds the window */
+    std::wstring hotkeyToggleMode = L"CTRL+SHIFT+F11";
+    std::wstring hotkeyHideOutput = L"CTRL+SHIFT+F12";
 
     void Load();
     void Save() const;

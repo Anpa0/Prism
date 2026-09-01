@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Prism
+GenericName=Screen-capture host
+Comment=Capture a Linux window or monitor and present it through Direct3D with ReShade
+Categories=Utility;
+Terminal=false
+NoDisplay=false
+Icon=video-display
+Exec=@PRISM_EXEC@

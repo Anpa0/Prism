@@ -109,6 +109,18 @@ Complicated shader packs (qUINT, CRT chains, depth-based effects) come later.
 Depth-based effects in particular cannot work here by design: Prism receives a
 flat colour image, so there is no depth buffer to give ReShade.
 
+## Using ReShade while playing
+
+In gameplay mode Prism is click-through and non-activating, so ReShade's overlay
+cannot receive input — that is the point: the keyboard and mouse belong to the
+game. Press `Ctrl+Shift+F11` to put Prism into configuration mode, which makes it
+an ordinary interactive window; ReShade's own overlay key (`Home` by default)
+then works normally. `Ctrl+Shift+F11` again returns input to the game.
+
+Prism deliberately does not try to press ReShade's overlay key for you.
+Synthesising input into ReShade is exactly the fragility configuration mode
+exists to avoid.
+
 ## Notes
 
 * ReShade processes Prism's back buffer, which holds the capture plus the black
@@ -118,3 +130,6 @@ flat colour image, so there is no depth buffer to give ReShade.
   separate window — so the only thing ReShade ever sees is the captured image.
 * Changing GPU in the **GPU** menu rebuilds the device and swap chain. ReShade
   re-initialises with it; Prism re-detects it afterwards.
+* ReShade attaches to whichever GPU Prism is rendering on. In the dual-GPU
+  configuration that is the NVIDIA card, and the game's own GPU never loads a
+  ReShade module — the diagnostics report names both.

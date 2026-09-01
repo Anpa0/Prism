@@ -21,8 +21,21 @@ extern "C" {
 #endif
 
 /* Bump whenever the ABI below changes in an incompatible way. Prism.exe
- * refuses to talk to a bridge that reports a different value. */
-#define PRISM_CAPTURE_ABI_VERSION 1u
+ * refuses to talk to a bridge that reports a different value.
+ *
+ *   1 - capture only
+ *   2 - adds the GlobalShortcuts portal, host app-id registration, Linux
+ *       system/GPU introspection, and frame buffer-size validation
+ */
+#define PRISM_CAPTURE_ABI_VERSION 2u
+
+/* Reverse-DNS application id. xdg-desktop-portal 1.20 added
+ * org.freedesktop.host.portal.Registry, and 1.21 made GlobalShortcuts refuse a
+ * session whose connection has an empty app id, so an unsandboxed process like
+ * Prism has to announce itself before it calls any other portal method. The id
+ * must match the basename of an installed .desktop file; ship the one in
+ * packaging/ to ~/.local/share/applications/. */
+#define PRISM_APP_ID "net.prism.Prism"
 
 /* The file Prism.exe passes to LoadLibraryW(). It is a Winelib module, i.e. an
  * ELF shared object with a PE-style export table, so it only resolves when
@@ -48,6 +61,11 @@ extern "C" {
  * no colour conversion ever happens on the way to Direct3D. */
 #define PRISM_FORMAT_BGRX 1u /* alpha byte is padding, treat as opaque */
 #define PRISM_FORMAT_BGRA 2u /* alpha byte is meaningful (ignored by Prism)  */
+/* Byte-swapped layouts. Some portal backends and virtual sources hand these
+ * over instead. They need an explicit channel swap, which Prism performs once,
+ * measures, and reports in diagnostics rather than silently reinterpreting. */
+#define PRISM_FORMAT_RGBX 3u
+#define PRISM_FORMAT_RGBA 4u
 
 /* Session state pushed to Prism.exe through the status callback. */
 #define PRISM_STATE_IDLE        0u /* stopped, nothing in flight              */
@@ -65,6 +83,9 @@ typedef struct PrismFrame
     unsigned long long pts_ns;   /* PipeWire presentation stamp, 0 = unknown */
     unsigned long long recv_ns;  /* CLOCK_MONOTONIC when the bridge got it   */
     unsigned long long sequence; /* monotonic counter of delivered frames    */
+    unsigned long long data_size; /* readable bytes at `data`, for bounds
+                                   * checking. Never assume height * pitch:
+                                   * a cropped frame starts partway in.      */
 } PrismFrame;
 
 typedef struct PrismBridgeStats
@@ -79,7 +100,10 @@ typedef struct PrismBridgeStats
     unsigned int       source_fps_num;    /* negotiated framerate numerator   */
     unsigned int       source_fps_den;    /* negotiated framerate denominator */
     unsigned int       state;             /* PRISM_STATE_*                    */
-    unsigned int       reserved;
+    unsigned int       source_stride;     /* negotiated bytes per row         */
+    unsigned int       source_max_size;   /* PipeWire buffer capacity         */
+    unsigned int       needs_swizzle;     /* 1 when the layout is R/B swapped */
+    double             callback_ms;       /* time spent in the last callback  */
 } PrismBridgeStats;
 
 /* The frame callback runs on the bridge's capture thread (a real Win32 thread
@@ -126,6 +150,93 @@ void __stdcall PrismCaptureGetStats(PrismBridgeStats* out);
 
 /* Stops the capture thread. Called before unloading the module. */
 void __stdcall PrismCaptureShutdown(void);
+
+/* ---------------------------------------------------- global shortcuts -- */
+
+/* Shortcut state, reported through PrismShortcutsGetStatus(). */
+#define PRISM_SHORTCUTS_UNAVAILABLE 0u /* no GlobalShortcuts portal here     */
+#define PRISM_SHORTCUTS_PENDING     1u /* session/bind request in flight     */
+#define PRISM_SHORTCUTS_BOUND       2u /* the compositor is delivering them  */
+#define PRISM_SHORTCUTS_DENIED      3u /* the user declined the bind dialog  */
+#define PRISM_SHORTCUTS_ERROR       4u /* see the message                    */
+
+#define PRISM_SHORTCUT_ID_MAX      64
+#define PRISM_SHORTCUT_TRIGGER_MAX 128
+#define PRISM_SHORTCUT_MAX          8
+
+typedef struct PrismShortcutSpec
+{
+    const char* id;                /* stable, e.g. "toggle-mode"            */
+    const char* description;       /* shown in the compositor's dialog      */
+    const char* preferred_trigger; /* XDG shortcuts syntax, e.g.
+                                    * "CTRL+SHIFT+F11". The user may change
+                                    * it; the compositor decides.           */
+} PrismShortcutSpec;
+
+typedef struct PrismShortcutBinding
+{
+    char id[PRISM_SHORTCUT_ID_MAX];
+    char trigger[PRISM_SHORTCUT_TRIGGER_MAX]; /* as the compositor describes it */
+} PrismShortcutBinding;
+
+/* Fires on the bridge's capture thread when the compositor reports the
+ * shortcut, whatever has focus. Post it to the UI thread; do not block. */
+typedef void(__stdcall* PrismShortcutCallback)(const char* shortcut_id, void* context);
+
+/* Creates a GlobalShortcuts session and binds `count` shortcuts in one go -
+ * the portal only allows one bind attempt per session. Returns S_OK once the
+ * request is dispatched; the outcome shows up in PrismShortcutsGetStatus().
+ * Safe to call when no portal exists: it reports UNAVAILABLE. */
+long __stdcall PrismShortcutsStart(const PrismShortcutSpec* shortcuts, unsigned int count,
+                                   PrismShortcutCallback on_activated, void* context);
+
+/* `message` receives a UTF-8 explanation, truncated to `message_bytes`. */
+unsigned int __stdcall PrismShortcutsGetStatus(char* message, unsigned int message_bytes);
+
+/* Copies up to `max` actual bindings; returns how many were written. */
+unsigned int __stdcall PrismShortcutsGetBindings(PrismShortcutBinding* out, unsigned int max);
+
+/* Asks the compositor to show its shortcut configuration UI for our session.
+ * Portal interface version 2 and later; a no-op elsewhere. */
+void __stdcall PrismShortcutsConfigure(void);
+
+void __stdcall PrismShortcutsStop(void);
+
+/* ------------------------------------------------- Linux system probing -- */
+
+#define PRISM_GPU_MAX 8
+
+typedef struct PrismGpuInfo
+{
+    char         pci_address[16]; /* 0000:03:00.0                            */
+    char         driver[32];      /* amdgpu, nvidia, i915, ...               */
+    char         name[160];       /* resolved from pci.ids when available    */
+    char         drm_card[32];    /* card1                                   */
+    char         drm_render[32];  /* renderD128                              */
+    char         by_path[160];    /* /dev/dri/by-path/pci-0000:03:00.0-card  */
+    char         link_speed_cur[24]; /* "16.0 GT/s PCIe"                     */
+    char         link_speed_max[24];
+    unsigned int vendor_id;
+    unsigned int device_id;
+    unsigned int link_width_cur;
+    unsigned int link_width_max;
+    unsigned int boot_vga;        /* 1 when the firmware booted on this one  */
+    unsigned int reserved;
+} PrismGpuInfo;
+
+typedef struct PrismSystemInfo
+{
+    unsigned int gpu_count;
+    PrismGpuInfo gpus[PRISM_GPU_MAX];
+    char         session_type[24];  /* wayland / x11                         */
+    char         desktop[48];       /* XDG_CURRENT_DESKTOP                   */
+    char         app_id[64];        /* what we registered with the portal    */
+    char         gpu_env[512];      /* the GPU-selection variables in effect  */
+} PrismSystemInfo;
+
+/* Fills `out` from sysfs and the environment. Cheap enough to call on a timer,
+ * but Prism only refreshes it on demand. */
+void __stdcall PrismSystemInfoQuery(PrismSystemInfo* out);
 
 #ifdef __cplusplus
 } /* extern "C" */

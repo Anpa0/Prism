@@ -52,7 +52,16 @@ version in its compatibility settings, and put
 | Flag | Effect |
 | --- | --- |
 | `--test-pattern` | Feed a synthetic pattern instead of capturing. Validates the renderer and ReShade without a portal or a game. |
+| `--gameplay` | Start straight into fullscreen gameplay output. |
+| `--monitor=N` | Put gameplay output on monitor N (see the Output Display menu). |
 | `--diagnostics` | Open the diagnostics window at startup. |
+| `--dump-diagnostics` | Write `prism-diagnostics.txt` next to `Prism.exe` ten seconds after start, and echo it to stderr. This is the file to attach when reporting a problem. |
+
+`run-prism.sh` adds one of its own:
+
+| Flag | Effect |
+| --- | --- |
+| `--gpu amd\|nvidia\|auto` | Which GPU Prism renders on. Affects Prism's process only — not the compositor, not other applications. |
 
 ## Using it
 
@@ -71,13 +80,35 @@ Menus:
 * **Frame Rate** — the consumption ceiling: Unlimited / Match Source, 30, 60,
   90, 120, 144, 165, 240. Prism never fabricates frames to reach these numbers.
 * **GPU** — automatic (high-performance adapter) or an explicit adapter.
-* **View** — Hide Output, Diagnostics, About.
+* **Output Display** — which monitor gameplay output goes fullscreen on, or
+  follow the Prism window.
+* **View** — Hide Output, toggle Gameplay/Configuration, Configure Global
+  Shortcuts, Diagnostics, Save Diagnostics Report, About.
+
+## Gameplay output
+
+**Display → Gameplay Output** puts Prism borderless-fullscreen over the game on
+the chosen monitor, on top and click-through: the keyboard and mouse keep driving
+the game while you watch Prism's processed image.
+
+| Key | Action |
+| --- | --- |
+| `Ctrl+Shift+F11` | Toggle gameplay / configuration mode (configuration makes Prism interactive so ReShade's overlay can be used) |
+| `Ctrl+Shift+F12` | Hide the gameplay output at once, leaving capture and the tray running |
+
+Both go through the XDG GlobalShortcuts portal so they fire while the game has
+focus. See [HOTKEYS.md](HOTKEYS.md) — including the one-time `.desktop` file the
+portal needs.
+
+Capture the **game window**, not the monitor: Prism is covering that monitor, so
+capturing it feeds Prism its own output.
 
 ## Tray operation
 
-Prism keeps a tray icon showing `Prism — Idle` or `Prism — Capturing` with the
-current rates. Right-click for capture source, start/stop, show/hide output,
-diagnostics and quit. Double-click toggles the output window.
+Prism keeps a tray icon showing `Prism — Idle`, `Prism — Capturing` or
+`Prism — Gameplay Output` with the current rates. Right-click for capture source,
+start/stop, show/hide gameplay output, Show Prism, diagnostics, global-shortcut
+settings and quit. Double-click toggles the output window.
 
 Hiding the output stops presentation but leaves capture running, so the session
 and its counters survive. Bring it back from the tray.
@@ -86,7 +117,7 @@ and its counters survive. Bring it back from the tray.
 
 `Prism.ini`, written next to `Prism.exe` on exit. It stores the display and
 window mode, frame ceiling, V-Sync, cursor and source-type preferences, adapter
-index, window size and diagnostics visibility. It is separate from `ReShade.ini`
+index, target monitor, hotkey triggers, window size and diagnostics visibility. It is separate from `ReShade.ini`
 and the two never interact.
 
 ## Logging

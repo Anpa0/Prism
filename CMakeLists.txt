@@ -32,6 +32,7 @@ add_executable(Prism WIN32
     src/Diagnostics.cpp
     src/Settings.cpp
     src/TestPattern.cpp
+    src/Hotkeys.cpp
 )
 
 target_include_directories(Prism PRIVATE src include)

@@ -6,9 +6,11 @@ One process, two halves, no daemon and no IPC.
 
 ```
                      Prism.exe  (PE64, MinGW-built, runs under Proton/Wine)
-                     ├── App            window, menus, tray, main loop
+                     ├── App            window, menus, tray, modes, main loop
                      ├── Renderer       D3D11 device, swap chain, present
                      ├── FrameMailbox   latest-frame triple buffer
+                     ├── Hotkeys        portal shortcuts + RegisterHotKey fallback
+                     ├── Diagnostics    counters, ReShade and GPU reporting
                      └── CaptureBridge  LoadLibraryW + GetProcAddress
                                 │
                                 │  direct function calls, same address space
@@ -16,7 +18,9 @@ One process, two halves, no daemon and no IPC.
                      PrismCapture.dll  (Winelib ELF, winegcc-built)
                      ├── prism_bridge.c  ABI surface, capture thread
                      ├── screencast.c    XDG ScreenCast portal driver
-                     ├── portal.c        org.freedesktop.portal.Request helper
+                     ├── shortcuts.c     XDG GlobalShortcuts portal driver
+                     ├── sysinfo.c       PCI/DRM/PCIe introspection from sysfs
+                     ├── portal.c        Request helper + host app-id registration
                      └── pipewire.c      stream negotiation and frame arrival
                                 │
                                 ▼
@@ -78,6 +82,10 @@ matches PipeWire's `BGRx` byte-for-byte and is the format ReShade handles best.
 | `PrismCaptureSetMaxFps` | Change the delivery ceiling of a live session |
 | `PrismCaptureGetStats` | Lock-free counters for the diagnostics panel |
 | `PrismCaptureShutdown` | Stop the capture thread before the process exits |
+| `PrismShortcutsStart` | Create a GlobalShortcuts session and bind Prism's two actions |
+| `PrismShortcutsGetStatus` / `GetBindings` | What the compositor decided |
+| `PrismShortcutsConfigure` / `Stop` | Open the compositor's editor; tear down |
+| `PrismSystemInfoQuery` | GPUs, PCI addresses, kernel drivers, PCIe link state |
 
 ### Threading
 
@@ -99,6 +107,14 @@ duration of the call — PipeWire recycles the buffer as soon as it returns — 
 `CaptureBridge::OnFrame` does exactly one thing: copy it into the mailbox.
 Direct3D is never touched from the capture thread.
 
+### Loaded is not the same as capture-ready
+
+The module being usable and the ScreenCast portal being available are tracked
+separately. A session with no ScreenCast backend still gets working global
+shortcuts, system diagnostics and the test pattern; only capture is disabled.
+Collapsing the two would mean one missing portal took out the hotkeys as well,
+which is how the coupling was found — see [TESTING.md](TESTING.md).
+
 ### Module lifetime
 
 Once `PrismCaptureInit` has run, the bridge is never `FreeLibrary`'d, even when
@@ -106,6 +122,24 @@ initialisation fails. GDBus starts a worker thread the moment it touches the
 session bus, and unmapping the shared object out from under that thread faults
 the process. The module stays mapped and inert instead; `CaptureBridge` tracks
 usability separately.
+
+## 3a. Host application registration
+
+Before anything else touches the bus, the bridge calls:
+
+```
+org.freedesktop.host.portal.Registry.Register("net.prism.Prism")
+```
+
+xdg-desktop-portal 1.20 introduced this handshake for unsandboxed applications,
+and 1.21 made `GlobalShortcuts.CreateSession` fail outright when the calling
+connection has no application id. Registration is one-shot per connection and
+must precede every other portal call, so it happens the instant the session bus
+connection is created. Older portals have no such interface, which is not an
+error.
+
+The id has to match the basename of an installed `.desktop` file;
+`scripts/install-desktop-file.sh` writes one. See [HOTKEYS.md](HOTKEYS.md).
 
 ## 4. XDG ScreenCast portal integration
 
@@ -129,12 +163,46 @@ KDE's portal has historically answered a single-source request with several
 streams, of which only the last is the selection. The response handler skips
 ahead to the last entry rather than failing, and logs when it has to.
 
+### Signal delivery
+
+The `Response` signals are subscribed with `G_DBUS_SIGNAL_FLAGS_NONE`, not
+`NO_MATCH_RULE`. xdg-desktop-portal exports each `Request` as an ordinary
+skeleton and emits `Response` as a **broadcast** with no destination, so the bus
+only routes it to us if a match rule exists. Suppressing the `AddMatch` saves one
+round trip per request and loses every reply — which is what a mock portal
+demonstrated before this was corrected.
+
 ## 5. PipeWire integration
 
-The stream is negotiated for `BGRx` (preferred) or `BGRA` only. Those are the
-two layouts that are byte-identical to `DXGI_FORMAT_B8G8R8A8_UNORM`, so nothing
-in Prism ever converts, subsamples or reinterprets a pixel. Any other format is
-refused with a clear error rather than silently guessed at.
+The stream is negotiated for `BGRx` (preferred), `BGRA`, `RGBx` or `RGBA`. The
+first two are byte-identical to `DXGI_FORMAT_B8G8R8A8_UNORM`; the second two are
+byte-identical to `DXGI_FORMAT_R8G8B8A8_UNORM`. Prism picks the texture format to
+match whatever was negotiated, so the sampler returns the same RGB either way and
+**no conversion happens at all** — not on the CPU and not on the GPU. Any other
+format is refused with a clear error rather than silently guessed at.
+
+The one exception is the shader-free fallback path, where
+`CopySubresourceRegion` cannot cross format families. There an RGBx source is
+swapped once on the CPU in the mailbox, timed, and reported in diagnostics as
+`Pixel path: CPU channel swap`. An invisible conversion would be worse than a
+slow one.
+
+### Nothing is assumed about layout
+
+A negotiated format is not a promise about memory layout, so every buffer is
+checked against what it reports rather than what it ought to contain:
+
+* `chunk->stride` is used when present and falls back to `width * 4`;
+* `chunk->offset` is honoured, so a chunk starting partway into the mapping is
+  handled;
+* the readable extent is derived from `maxsize`, `offset` and `chunk->size`;
+* a crop rectangle is validated against the frame before being applied;
+* the frame is accepted only if `(height - 1) * stride + width * 4` fits inside
+  that extent — the last row needs its visible pixels, not a full padded stride.
+
+Anything failing those checks is counted and recycled, never copied. The mailbox
+repeats the bounds check on the PE side, so a malformed buffer cannot become an
+out-of-bounds read whatever the portal backend does.
 
 The framerate range is negotiated open-ended (up to 1000/1) so a 144 Hz or
 240 Hz source is not clamped to 60.
@@ -220,6 +288,55 @@ overlay on the back buffer. An overlay would be processed by ReShade along with
 the captured image, which would both corrupt the diagnostic and pollute the
 picture.
 
+## 8a. Gameplay and configuration modes
+
+Prism has two output postures, switched by a global shortcut.
+
+**Gameplay output** is a borderless fullscreen window on the chosen monitor,
+stacked above the game and deliberately inert:
+
+* `WS_EX_NOACTIVATE` keeps it out of the focus chain, so showing it or clicking
+  it never takes the foreground from the game;
+* `WS_EX_TRANSPARENT` makes hit-testing fall through to the window underneath;
+* `WM_MOUSEACTIVATE` returns `MA_NOACTIVATEANDEAT` as a second line of defence.
+
+Together those mean the real keyboard and mouse keep driving the real game while
+the user watches Prism. **Prism forwards nothing and synthesises nothing** —
+there is no input injection anywhere in the codebase, which is both simpler and
+the only approach that survives anti-cheat and Wayland's input model.
+
+**Configuration mode** clears both styles, takes the foreground, and lets ReShade's
+overlay be used normally. The game loses focus for as long as it lasts, which is
+the honest trade: one click cannot drive both ReShade and the game.
+
+Prism does not try to press ReShade's overlay key for the user. Synthesising
+input into ReShade is exactly the kind of fragility configuration mode exists to
+avoid; making Prism interactive and letting the normal overlay hotkey work is
+both simpler and more reliable.
+
+Wine maps both extended styles onto its X11/Wayland windows, but a compositor is
+free to disagree about stacking and focus. This is the one part of Prism that
+genuinely needs checking on a real KDE session rather than reasoning about.
+
+### Capture the window, not the screen
+
+In gameplay mode Prism covers the monitor it is displaying on. Capturing that
+monitor would feed Prism its own output — Prism inside Prism inside Prism. Pick
+the **game window** as the source, not the screen, unless recursion is what you
+are testing.
+
+## 8b. Global shortcuts
+
+Wayland gives no application a key grab, so the hotkeys go through the XDG
+GlobalShortcuts portal, driven by the bridge on the same GLib loop as everything
+else. `Activated` arrives as a D-Bus signal whatever has focus, is dispatched on
+the capture thread, and is posted straight to the UI thread untouched.
+
+`RegisterHotKey` is kept as a fallback and armed only once the portal has
+definitively failed, so a bound shortcut never fires twice. Under Wayland that
+fallback is focus-bound and near-useless for gameplay mode; the diagnostics
+window says so when it is in use. Details in [HOTKEYS.md](HOTKEYS.md).
+
 ## 9. GPU selection
 
 Adapter 0 is not assumed to be correct — on a laptop it is often the integrated
@@ -230,6 +347,22 @@ them in the **GPU** menu with their descriptions. The default is
 display; an explicit choice overrides it and is stored in `Prism.ini`. Changing
 the adapter rebuilds the device and swap chain in place, pausing and resuming
 any live capture session around the rebuild.
+
+## 9a. Linux-side introspection
+
+DXGI tells Prism an adapter's description, IDs and VRAM, and nothing else. It has
+no idea about PCI topology, which kernel driver is bound, or what a PCIe link
+actually trained at — which matters when the second GPU arrives over
+M.2-to-OCuLink and can quietly come up at Gen3 x2.
+
+So the bridge reads it from sysfs and hands it back: PCI address, vendor/device
+IDs, bound driver, DRM card and render nodes, the stable `/dev/dri/by-path` name,
+current and maximum link speed and width, and the GPU-selection environment in
+effect. Devices are keyed by PCI address throughout — `card0` and `card1` are
+assigned in probe order and can swap between boots.
+
+The diagnostics panel cross-references the two sides, marking each detected GPU
+`Used by Prism: Yes/No` by matching PCI IDs against the adapter DXGI handed over.
 
 ## 10. Captured-application isolation
 
