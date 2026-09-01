@@ -1,0 +1,18 @@
+# Build output
+build/
+
+# Winelib intermediate; the Makefile renames it to PrismCapture.dll
+*.dll.so
+*.o
+
+# Runtime state, written next to Prism.exe
+Prism.ini
+prism.log
+
+# ReShade, installed by the user alongside Prism.exe
+dxgi.dll
+d3d11.dll
+ReShade.ini
+ReShadePreset.ini
+ReShadeLog.txt
+reshade-shaders/
